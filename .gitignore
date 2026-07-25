@@ -13,3 +13,4 @@ frontend/dist/
 .vscode/
 scene_profile.json
 vision_profile.json
+*.tsbuildinfo

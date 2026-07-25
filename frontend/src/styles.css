@@ -1,0 +1,279 @@
+/* Minimal token subset for the worker phone client. David owns the full design
+   system (frontend/tailwind.config.ts, frontend/src/styles/tokens.css) — this file
+   exists only so Nikki's routes aren't unstyled until that lands. */
+
+:root {
+  --bg-0: #08090b;
+  --bg-1: #0e1013;
+  --fg-0: #f5f7fa;
+  --fg-1: #a2acbb;
+  --fg-2: #626c7a;
+  --ok: #30d158;
+  --warn: #ff9f0a;
+  --crit: #ff375f;
+  --info: #5ac8fa;
+
+  --w-a: #5ac8fa;
+  --w-b: #5e5ce6;
+  --w-c: #30d158;
+  --w-d: #ff9f0a;
+  --w-e: #ff375f;
+
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: -apple-system, "Inter", system-ui, sans-serif;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── /join ─────────────────────────────────────────────────────────────────── */
+
+.join-screen {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  padding: 24px;
+  text-align: center;
+}
+
+.join-screen h1 {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  margin: 0;
+}
+
+.join-status {
+  color: var(--fg-1);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.join-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--info);
+  animation: pulse 1.6s var(--ease) infinite;
+}
+
+.join-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.join-callsign {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.join-role {
+  color: var(--fg-1);
+  font-size: 15px;
+}
+
+.join-btn {
+  width: min(320px, 80vw);
+  min-height: 64px;
+  border-radius: 14px;
+  border: 1px solid var(--fg-2);
+  background: var(--bg-1);
+  color: var(--fg-0);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.join-btn-primary {
+  min-height: 72px;
+  border: none;
+  color: #08090b;
+}
+
+/* ── /worker/:id ───────────────────────────────────────────────────────────── */
+
+.worker-screen {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 16px;
+}
+
+.worker-status {
+  margin: auto;
+  color: var(--fg-1);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.worker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.worker-callsign {
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.worker-link {
+  color: var(--fg-2);
+}
+
+.worker-idle {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.worker-pulse {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  animation: pulse 2.4s var(--ease) infinite;
+}
+
+.worker-standby {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.worker-substatus {
+  color: var(--fg-1);
+  font-size: 15px;
+  max-width: 260px;
+}
+
+.worker-chip {
+  font-size: 12px;
+  color: var(--fg-2);
+  border: 1px solid var(--fg-2);
+  border-radius: 999px;
+  padding: 4px 12px;
+}
+
+.worker-instruction {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+}
+
+.worker-display-text {
+  font-size: 34px;
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.worker-detail-text {
+  color: var(--fg-1);
+  font-size: 16px;
+}
+
+.worker-timeout-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-1);
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.worker-timeout-fill {
+  height: 100%;
+  transition: width 250ms linear;
+}
+
+.worker-timeout-label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  color: var(--fg-2);
+}
+
+.worker-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.worker-btn {
+  min-height: 64px;
+  border-radius: 14px;
+  border: 1px solid var(--fg-2);
+  background: var(--bg-1);
+  color: var(--fg-0);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.worker-btn-primary {
+  min-height: 72px;
+  border: none;
+  color: #08090b;
+}
+
+.worker-btn-row {
+  display: flex;
+  gap: 10px;
+}
+
+.worker-btn-row .worker-btn {
+  flex: 1;
+  min-height: 56px;
+}
+
+.worker-btn-emergency {
+  border-color: var(--crit);
+  color: var(--crit);
+}
+
+.worker-btn-emergency.arming {
+  background: var(--crit);
+  color: #08090b;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.5; transform: scale(0.92); }
+  50% { opacity: 1; transform: scale(1); }
+}
