@@ -1,185 +1,142 @@
-"""Camera capture + frame ring buffer.
+"""Threaded camera capture. Never blocks the asyncio event loop, never raises.
 
-OWNER: Steven (capture) / Ojas (ring buffer feeds the reasoning burst).
-
-Capture runs on a dedicated THREAD, never in the event loop: cv2.read() blocks ~30ms and
-in the async loop that stutters every phone in the room. The thread writes the newest
-frame into a single slot and appends JPEGs to a short ring buffer that the perception
-layer samples when something interesting happens.
+Requests the camera's native MJPEG mode at 720p — USB webcams (this was tuned
+against a Logitech C920) only unlock their higher resolutions/framerates in
+that mode; the default raw YUY2 path caps out around 640x480. Consumers are
+notified of new frames via a condition variable instead of polling on a fixed
+sleep, so end-to-end latency tracks the camera's actual frame interval rather
+than an arbitrary poll period.
 """
-
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from collections import deque
 
 import cv2
 import numpy as np
 
-from ..config import settings
+log = logging.getLogger("hive.vision.camera")
 
-log = logging.getLogger("hive.camera")
-
-PROC_W, PROC_H = 640, 360
-
-
-def probe_cameras(max_index: int = 4) -> list[dict]:
-    """Enumerate working capture devices. Indices shift when devices are replugged, so
-    the host UI offers a picker rather than trusting a constant."""
-    out = []
-    for i in range(max_index):
-        cap = cv2.VideoCapture(i)
-        try:
-            if not cap.isOpened():
-                continue
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-            out.append(
-                {
-                    "index": i,
-                    "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                    "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                    "brightness": round(float(np.mean(frame)), 1),
-                    "active": i == settings.camera_index,
-                }
-            )
-        except Exception:
-            continue
-        finally:
-            cap.release()
-    return out
+DISPLAY_WIDTH = 1280
+DISPLAY_HEIGHT = 720
+REQUEST_FPS = 30
+REOPEN_INTERVAL_S = 5.0
 
 
 class Camera:
-    """Threaded capture with a JPEG ring buffer."""
-
-    def __init__(self, index: int | None = None) -> None:
-        self.index = index if index is not None else settings.camera_index
+    def __init__(self, index: int = 0) -> None:
+        self.index = index
         self._cap: cv2.VideoCapture | None = None
         self._frame: np.ndarray | None = None
-        self._lock = threading.Lock()
+        self._frame_version = 0
+        self._cond = threading.Condition()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._fps = 0.0
-        self._ring: deque[tuple[float, bytes]] = deque(maxlen=90)
-        self.error: str | None = None
-
-    # ── lifecycle ───────────────────────────────────────────────────────────
+        self._online = False
+        self._last_open_attempt = 0.0
+        self.actual_width = 0
+        self.actual_height = 0
+        self.actual_fps = 0.0
 
     @property
     def online(self) -> bool:
-        return self._cap is not None and self._frame is not None
+        return self._online
 
-    @property
-    def fps(self) -> float:
-        return round(self._fps, 1)
-
-    def open(self, index: int | None = None) -> bool:
-        """Returns False (never raises) on a missing or denied device."""
-        if index is not None and index != self.index:
-            self.release()
-            self.index = index
-        if self._cap is not None:
-            return True
+    def open(self) -> bool:
+        """Attempt to open the device. Returns False, never raises, on failure."""
+        self._last_open_attempt = time.time()
         try:
             cap = cv2.VideoCapture(self.index)
             if not cap.isOpened():
                 cap.release()
-                self.error = f"camera {self.index} unavailable"
-                log.warning(self.error)
+                self._online = False
                 return False
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                cap.release()
-                self.error = f"camera {self.index} opened but produced no frame"
-                log.warning(self.error)
-                return False
+            # Order matters: width/height before FOURCC, or the driver silently
+            # ignores the resolution request and falls back to its raw-mode cap.
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FPS, REQUEST_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize driver-side frame queuing
             self._cap = cap
-            self._frame = cv2.resize(frame, (PROC_W, PROC_H))
-            self.error = None
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._loop, daemon=True, name="hive-capture")
-            self._thread.start()
-            log.info("camera %s online", self.index)
+            self._online = True
+            self._start_thread()
             return True
-        except Exception as e:
-            self.error = f"{type(e).__name__}: {e}"
-            log.warning("camera open failed: %s", self.error)
+        except Exception:
+            log.exception("camera open failed")
+            self._online = False
             return False
+
+    def _start_thread(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self) -> None:
+        fps_count = 0
+        fps_t0 = time.time()
+        while not self._stop.is_set():
+            try:
+                cap = self._cap
+                if cap is None:
+                    time.sleep(0.1)
+                    continue
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    self._online = False
+                    time.sleep(0.1)
+                    continue
+                self._online = True
+                self.actual_height, self.actual_width = frame.shape[:2]
+                with self._cond:
+                    self._frame = frame
+                    self._frame_version += 1
+                    self._cond.notify_all()
+                fps_count += 1
+                now = time.time()
+                if now - fps_t0 >= 1.0:
+                    self.actual_fps = fps_count / (now - fps_t0)
+                    fps_count = 0
+                    fps_t0 = now
+            except Exception:
+                log.exception("camera capture loop")
+                self._online = False
+                time.sleep(0.5)
+
+    def read(self) -> np.ndarray | None:
+        """Returns the newest captured frame (a copy), or None. Non-blocking."""
+        with self._cond:
+            if self._frame is None:
+                return None
+            return self._frame.copy()
+
+    def wait_for_new_frame(self, last_version: int, timeout: float = 1.0) -> tuple[np.ndarray | None, int]:
+        """Blocks (call via asyncio.to_thread) until a frame newer than
+        `last_version` arrives, or `timeout` elapses. Multiple independent
+        consumers can each track their own last_version safely.
+        Returns (frame_copy_or_None, new_version)."""
+        with self._cond:
+            got = self._cond.wait_for(lambda: self._frame_version > last_version, timeout=timeout)
+            if not got or self._frame is None:
+                return None, last_version
+            return self._frame.copy(), self._frame_version
+
+    def maybe_reopen(self) -> bool:
+        """Retry opening at most every REOPEN_INTERVAL_S. Call from the vision tick."""
+        if self._online:
+            return True
+        if time.time() - self._last_open_attempt < REOPEN_INTERVAL_S:
+            return False
+        return self.open()
 
     def release(self) -> None:
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=1.5)
-            self._thread = None
-        if self._cap:
+            self._thread.join(timeout=1.0)
+        if self._cap is not None:
             self._cap.release()
-            self._cap = None
-        self._frame = None
-        self._ring.clear()
-
-    # ── capture thread ──────────────────────────────────────────────────────
-
-    def _loop(self) -> None:
-        last_jpeg = 0.0
-        frames, t0 = 0, time.monotonic()
-        while not self._stop.is_set():
-            cap = self._cap
-            if cap is None:
-                break
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                time.sleep(0.05)
-                continue
-            small = cv2.resize(frame, (PROC_W, PROC_H))
-            with self._lock:
-                self._frame = small
-            frames += 1
-            now = time.monotonic()
-            if now - t0 >= 1.0:
-                self._fps = frames / (now - t0)
-                frames, t0 = 0, now
-            # Ring buffer at ~6 Hz — enough to sample a 2s burst at 2 fps without
-            # holding a wall of JPEGs in memory.
-            if now - last_jpeg >= 1 / 6:
-                last_jpeg = now
-                enc = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 72])[1]
-                self._ring.append((now, enc.tobytes()))
-            time.sleep(0.005)
-
-    # ── access ──────────────────────────────────────────────────────────────
-
-    def latest(self) -> np.ndarray | None:
-        with self._lock:
-            return None if self._frame is None else self._frame.copy()
-
-    def snapshot_jpeg(self, quality: int = 75) -> bytes | None:
-        f = self.latest()
-        if f is None:
-            return None
-        return cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tobytes()
-
-    def burst(self, count: int = 5, seconds: float = 2.5) -> list[bytes]:
-        """The most recent `count` frames spanning ~`seconds`, oldest first.
-
-        This is what a reasoning burst consumes: 4–8 frames over the last couple of
-        seconds beats one still, because most questions we ask are about CHANGE.
-        """
-        if not self._ring:
-            return []
-        now = time.monotonic()
-        recent = [(t, j) for t, j in list(self._ring) if now - t <= seconds]
-        if not recent:
-            recent = list(self._ring)[-count:]
-        if len(recent) <= count:
-            return [j for _, j in recent]
-        step = len(recent) / count
-        return [recent[min(len(recent) - 1, int(i * step))][1] for i in range(count)]
-
-
-camera = Camera()
+        self._cap = None
+        self._online = False

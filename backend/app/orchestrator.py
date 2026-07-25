@@ -15,11 +15,12 @@ import time
 from typing import Any
 
 from . import recovery as recovery_engine
+from .attribution import attribution
 from . import scheduler, verifier
 from .config import settings
 from .models import Action, Evidence, Instruction, now_iso
 from .state import state
-from .vision import world_model
+from .vision import bridge as world_model
 from .websocket_manager import ws
 
 log = logging.getLogger("hive.orchestrator")
@@ -143,6 +144,7 @@ def evaluate_verifications() -> None:
 
 
 def _mark_verified(a: Action, summary: str) -> None:
+    attribution.note_verified(a, state)
     a.status = "verified"
     a.completed_at = now_iso()
     state.free_locks_for(a.id)
@@ -249,6 +251,7 @@ def _apply_recovery(plan: recovery_engine.RecoveryPlan) -> None:
             a.retry_count += 1
             _release_worker_id(prev)
             if prev:
+                attribution.note_failure(prev, reassigned=True)
                 pw = state.worker(prev)
                 if pw and t.kind == "worker_timeout":
                     pw.confidence = 0.6  # scheduler's risk penalty now avoids them
@@ -304,6 +307,37 @@ def _cancel_instruction(a: Action, reason: str) -> None:
 # ── 9. scheduling ───────────────────────────────────────────────────────────
 
 
+def _apply_attribution(action: Action, chosen: Any, view: Any, claimed: set[str]) -> Any:
+    """Re-rank viable candidates using observed performance; explain any change."""
+    try:
+        cands = [c for c in scheduler.score_workers(action, view) if c.viable]
+    except Exception:
+        return chosen
+    if len(cands) < 2:
+        return chosen
+
+    ranked = []
+    for c in cands:
+        if c.worker_id in claimed and c.worker_id != chosen.worker_id:
+            continue
+        delta, reasons = attribution.adjust(c.worker_id, action)
+        ranked.append((c.score + delta, c, reasons))
+    if not ranked:
+        return chosen
+    ranked.sort(key=lambda r: r[0])
+    _, best, reasons = ranked[0]
+
+    if best.worker_id != chosen.worker_id and reasons:
+        # Say plainly that the change came from observed performance, and who lost out.
+        best.reason = (
+            f"{best.callsign} selected on record: {', '.join(reasons[:2])}. "
+            f"{chosen.callsign} scored better on position alone."
+        )
+    elif reasons:
+        best.reason = f"{best.reason.rstrip('.')}. Record: {reasons[0]}."
+    return best
+
+
 class _SchedulerView:
     """List-shaped view of HiveState, matching scheduler.SchedulerState.
 
@@ -348,7 +382,14 @@ class _SchedulerView:
 
 
 def schedule_actions() -> None:
-    for action, assignment in scheduler.select_batch(_SchedulerView(state)):
+    view = _SchedulerView(state)
+    claimed: set[str] = set()
+    for action, assignment in scheduler.select_batch(view):
+        # The scheduler answers "who CAN do this" from capability, reachability and load.
+        # Attribution answers "who SHOULD" from what has actually happened this run. It
+        # only ever re-orders candidates the scheduler already judged viable.
+        assignment = _apply_attribution(action, assignment, view, claimed)
+        claimed.add(assignment.worker_id)
         action.assigned_worker_id = assignment.worker_id
         action.assignment_reason = assignment.reason
         action.status = "assigned"
@@ -400,10 +441,23 @@ def dispatch() -> None:
         ws.mark_workers_dirty()
 
 
+def _bare(label: str) -> str:
+    """Strip a leading article so "the {label}" never reads "the the scanner".
+
+    Roles come from the operator's own words ("the priority item"), which is right for
+    display but wrong once a template supplies its own article.
+    """
+    s = (label or "").strip()
+    for article in ("the ", "a ", "an "):
+        if s.lower().startswith(article):
+            return s[len(article):]
+    return s
+
+
 def build_instruction(a: Action, w: Any) -> Instruction:
     """Instruction ids are unique per (action, attempt). That uniqueness is what makes
     speak-once work on the phone: a re-render is silent, a genuine re-issue speaks."""
-    label = state.label_of(a.object_id) if a.object_id else ""
+    label = _bare(state.label_of(a.object_id)) if a.object_id else ""
     zone = state.zone_label(a.target_zone) if a.target_zone else ""
     urgency = "critical" if a.is_recovery or a.retry_count >= 2 else ("high" if a.retry_count else "normal")
 
@@ -486,7 +540,11 @@ def check_goal() -> None:
         f"{int(m.avg_confidence * 100)}% mean confidence.",
         severity="success",
         report=m.model_dump(),
+        contributions=attribution.leaderboard(state),
     )
+    note = attribution.after_action(state)
+    if note:
+        state.emit_soon("after_action", note, severity="info")
     ws.mark_actions_dirty()
 
 
@@ -513,6 +571,7 @@ def on_worker_completed(p: dict, wid: str | None) -> None:
         return  # not yours
     if any(e.kind == "worker_report" for e in a.evidence):
         return  # already counted — double tap, or a retry after a socket blip
+    attribution.note_claim(wid)
     a.evidence.append(
         Evidence(kind="worker_report", confidence=float(p.get("confidence") or 1.0), detail="worker reported done")
     )

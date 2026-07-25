@@ -1,167 +1,199 @@
-"""Simulation mode — a first-class world source, not a placeholder.
-
-OWNER: Steven. This is a complete working implementation so the whole stack runs
-without a camera; replace/extend in place.
-
-Objects here are GENERATED, not hardcoded — same descriptor path as real discovery.
-Simulation must never be the one mode where a fixed object manifest sneaks back in.
-"""
-
+"""Simulation mode — a first-class mode, not a placeholder. Lets any one
+person demo the whole vision stack alone with no camera, no phones.
+See Steven.md §8."""
 from __future__ import annotations
 
-import colorsys
+import asyncio
 import random
 import time
+from dataclasses import dataclass, field
 
-from ..models import Descriptor, ObservedObject, Point, Scene, now_iso
+from app.models import Descriptor, ObservedObject, Vec2
+from app.state import HiveState
+from app.vision.scene_discovery import hsv_to_hex, name_hue
 
-# A generic hue→name function. This is the ONLY colour knowledge in the system and it
-# names an arbitrary measured hue; it does not know what a red thing *is*.
-HUE_NAMES: list[tuple[int, str]] = [
-    (0, "red"), (15, "orange"), (28, "yellow"), (38, "lime"), (52, "green"),
-    (85, "teal"), (100, "cyan"), (115, "blue"), (135, "indigo"), (150, "purple"),
-    (165, "magenta"), (179, "red"),
-]
+SHAPES = ["round", "rectangular", "irregular"]
+MOVE_SECONDS = 1.5
 
 
-def circular_hue_dist(a: float, b: float) -> float:
-    d = abs(a - b) % 180
-    return min(d, 180 - d)
+@dataclass
+class SimWorker:
+    id: str
+    callsign: str
+    busy_until: float = 0.0
 
 
-def name_hue(h: float, s: float, v: float) -> str:
-    if v < 55:
-        return "black"
-    if s < 40:
-        return "white" if v > 190 else "grey"
-    return min(HUE_NAMES, key=lambda hn: circular_hue_dist(h, hn[0]))[1]
-
-
-def hsv_to_hex(h: float, s: float, v: float) -> str:
-    r, g, b = colorsys.hsv_to_rgb((h % 180) / 180.0, s / 255.0, v / 255.0)
-    return "#%02X%02X%02X" % (int(r * 255), int(g * 255), int(b * 255))
+@dataclass
+class _Motion:
+    object_id: str
+    start: Vec2
+    target: Vec2
+    started_at: float
+    duration: float = MOVE_SECONDS
+    on_complete: object = None
 
 
 class Simulator:
-    """Drives a virtual workspace and can auto-execute actions."""
+    def __init__(self, state: HiveState) -> None:
+        self.state = state
+        self.workers: list[SimWorker] = []
+        self._motions: dict[str, _Motion] = {}
 
-    def __init__(self) -> None:
-        self.animations: dict[str, tuple[Point, Point, float, float]] = {}
-        self.auto_execute: bool = False
-
-    # ── scene generation ────────────────────────────────────────────────────
-
-    def spawn_scene(self, scene: Scene, n: int = 5) -> None:
-        """Generate n objects with distinct hues. Ids are synthetic and carry no meaning."""
-        scene.objects = []
-        # Hues chosen to land squarely on distinct names via name_hue(), so a simulated
-        # scene reads like a real table of well-separated objects.
-        hues = [2, 18, 28, 55, 115, 150, 95][: max(n, 1)]
-        random.shuffle(hues)
-        zones = [z.id for z in scene.zones] or ["field"]
-        for i, h in enumerate(hues[:n], start=1):
-            s, v = random.randint(190, 240), random.randint(170, 225)
-            zone = zones[(i - 1) % len(zones)]
-            z = scene.zone_by_id(zone)
-            base = z.bounds.center if z else Point(x=0.5, y=0.5)
-            pos = Point(
-                x=round(min(0.97, max(0.03, base.x + random.uniform(-0.05, 0.05))), 3),
-                y=round(min(0.97, max(0.03, base.y + random.uniform(-0.05, 0.05))), 3),
+    def spawn_scene(self, n: int = 5) -> list[ObservedObject]:
+        """Objects are generated, not hardcoded: randomized hues, positions, shapes,
+        run through the identical descriptor path as real detections."""
+        objects: list[ObservedObject] = []
+        used_hues: list[int] = []
+        for i in range(1, n + 1):
+            h = self._distinct_hue(used_hues)
+            used_hues.append(h)
+            s, v = random.randint(150, 230), random.randint(150, 230)
+            shape = random.choice(SHAPES)
+            aspect = 1.0 if shape == "round" else random.choice([0.6, 1.6])
+            circularity = 0.85 if shape == "round" else 0.55
+            descriptor = Descriptor(
+                dominant_hsv=(h, s, v),
+                color_name=name_hue(h, s, v),
+                color_hex=hsv_to_hex(h, s, v),
+                area_norm=round(random.uniform(0.015, 0.03), 4),
+                aspect=aspect,
+                circularity=circularity,
+                shape_hint=shape,
             )
-            circ = random.uniform(0.55, 0.95)
-            scene.objects.append(
-                ObservedObject(
-                    id=f"obj_{i}",
-                    descriptor=Descriptor(
-                        dominant_hsv=(h, s, v),
-                        color_name=name_hue(h, s, v),
-                        color_hex=hsv_to_hex(h, s, v),
-                        area_norm=round(random.uniform(0.012, 0.028), 4),
-                        aspect=round(random.uniform(0.85, 1.25), 2),
-                        circularity=round(circ, 2),
-                        shape_hint="round" if circ > 0.75 else "rectangular",
-                    ),
-                    position=pos,
-                    zone=zone,
-                    confidence=0.95,
-                    source="simulation",
-                )
-            )
-        scene.scanned_at = now_iso()
-        scene.stable = True
-        scene.labeling_source = "descriptor"
-        self.animations.clear()
-        self._reclassify(scene)
+            pos = Vec2(x=round(random.uniform(0.1, 0.9), 3), y=round(random.uniform(0.1, 0.9), 3))
+            objects.append(ObservedObject(
+                id=f"obj_{i}",
+                descriptor=descriptor,
+                position=pos,
+                zone=self._classify(pos),
+                visible=True,
+                confidence=0.95,
+                source="simulation",
+            ))
+        self.state.scene.objects = objects
+        self.state.scene.object_count = len(objects)
+        self.state.scene.stable = True
+        self.state.world.objects = objects
+        self.state.world.mode = "simulation"
+        self.state.mark_world_dirty()
+        return objects
 
-    # ── motion ──────────────────────────────────────────────────────────────
+    def _distinct_hue(self, used: list[int], min_gap: int = 25) -> int:
+        """Pick a hue that is distinct in NAME, not just in degrees.
 
-    def move_to(self, scene: Scene, object_id: str, target: Point, duration: float = 1.5) -> None:
-        obj = scene.by_id(object_id)
-        if not obj:
-            return
-        self.animations[object_id] = (obj.position, target, time.monotonic(), duration)
+        Hue distance alone is not enough: "indigo" and "magenta" are far apart numerically
+        but normalize to adjacent colour words, so an objective saying "the indigo item"
+        would be genuinely ambiguous. A well-set-up table has objects a person can name
+        unambiguously, and a simulated scene should be no different.
+        """
+        from app.planner.grounding import COLOR_SYNONYMS
 
-    def move_to_zone(self, scene: Scene, object_id: str, zone_id: str, duration: float = 1.5) -> None:
-        z = scene.zone_by_id(zone_id)
-        if not z:
-            return
-        c = z.bounds.center
-        jitter = Point(
-            x=round(min(0.97, max(0.03, c.x + random.uniform(-0.04, 0.04))), 3),
-            y=round(min(0.97, max(0.03, c.y + random.uniform(-0.04, 0.04))), 3),
-        )
-        self.move_to(scene, object_id, jitter, duration)
+        def canonical(h: int) -> str:
+            name = name_hue(h, 200, 200)
+            return COLOR_SYNONYMS.get(name, name)
 
-    def place(self, scene: Scene, object_id: str, position: Point) -> None:
-        """Instant placement (host drag / failure injection)."""
-        obj = scene.by_id(object_id)
-        if not obj:
-            return
-        self.animations.pop(object_id, None)
-        obj.position = position
-        obj.last_updated_at = now_iso()
-        self._reclassify(scene)
-
-    def step(self, scene: Scene) -> bool:
-        """Advance animations. Returns True if anything changed."""
-        if not self.animations:
-            return False
-        now = time.monotonic()
-        changed = False
-        for oid, (start, end, t0, dur) in list(self.animations.items()):
-            obj = scene.by_id(oid)
-            if obj is None:
-                self.animations.pop(oid, None)
+        taken = {canonical(u) for u in used}
+        for _ in range(60):
+            h = random.randint(0, 179)
+            if canonical(h) in taken:
                 continue
-            t = min(1.0, (now - t0) / max(dur, 0.01))
-            e = 1 - (1 - t) ** 3  # ease-out cubic; objects glide, never teleport
-            obj.position = Point(
-                x=round(start.x + (end.x - start.x) * e, 4),
-                y=round(start.y + (end.y - start.y) * e, 4),
+            if all(min(abs(h - u), 180 - abs(h - u)) >= min_gap for u in used):
+                return h
+        # Fall back to any hue with an unused name before giving up entirely.
+        for _ in range(60):
+            h = random.randint(0, 179)
+            if canonical(h) not in taken:
+                return h
+        return random.randint(0, 179)
+
+    def _classify(self, p: Vec2) -> str:
+        for z in self.state.scene.zones:
+            if z.bounds.contains(p):
+                return z.id
+        return "field"
+
+    # ---- interaction --------------------------------------------------
+    def drag(self, object_id: str, position: Vec2) -> None:
+        for o in self.state.scene.objects:
+            if o.id == object_id:
+                o.position = position
+                o.zone = self._classify(position)
+                o.confidence = 0.95
+                o.source = "simulation"
+        self.state.world.objects = self.state.scene.objects
+        self.state.mark_world_dirty()
+
+    async def auto_execute(self, object_id: str, target: Vec2) -> None:
+        """Animate the object toward the target over ~1.5s, then report completion.
+        Never teleports — the interpolation is most of why this looks premium."""
+        obj = next((o for o in self.state.scene.objects if o.id == object_id), None)
+        if obj is None:
+            return
+        start = Vec2(x=obj.position.x, y=obj.position.y)
+        t0 = time.time()
+        while True:
+            elapsed = time.time() - t0
+            frac = min(1.0, elapsed / MOVE_SECONDS)
+            obj.position = Vec2(
+                x=start.x + (target.x - start.x) * frac,
+                y=start.y + (target.y - start.y) * frac,
             )
-            obj.last_updated_at = now_iso()
-            changed = True
-            if t >= 1.0:
-                self.animations.pop(oid, None)
-        if changed:
-            self._reclassify(scene)
-        return changed
+            obj.zone = self._classify(obj.position)
+            self.state.world.objects = self.state.scene.objects
+            self.state.mark_world_dirty()
+            if frac >= 1.0:
+                break
+            await asyncio.sleep(0.05)
+        self.state.emit_nowait(
+            "action_completed",
+            f"{obj.display_label()} arrived at {obj.zone}.",
+            severity="success",
+            metadata={"object_id": object_id},
+        )
 
-    # ── zones ───────────────────────────────────────────────────────────────
+    def spawn_workers(self, n: int = 5) -> list[SimWorker]:
+        """Fake worker sockets for solo testing — highest-leverage thing in this
+        file, build it in hour one."""
+        callsigns = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO"]
+        self.workers = [SimWorker(id=f"worker_{chr(97+i)}", callsign=callsigns[i]) for i in range(n)]
+        return self.workers
 
-    @staticmethod
-    def _reclassify(scene: Scene) -> None:
-        for obj in scene.objects:
-            obj.zone = classify_zone(scene, obj.position)
-        for z in scene.zones:
-            z.occupancy = [o.id for o in scene.objects if o.zone == z.id]
+    async def simulate_worker_cycle(self, worker: SimWorker) -> None:
+        """Realistic delay: 1-3s to acknowledge, 3-6s to complete. One worker
+        should occasionally be slow to keep timeout logic honest."""
+        await asyncio.sleep(random.uniform(1, 3))
+        slow = random.random() < 0.2
+        await asyncio.sleep(random.uniform(6, 10) if slow else random.uniform(3, 6))
 
-
-def classify_zone(scene: Scene, p: Point, margin: float = 0.0) -> str:
-    for z in scene.zones:
-        if z.bounds.contains(p, margin):
-            return z.id
-    return "field"
-
-
-simulator = Simulator()
+    def inject(self, kind: str, target_id: str | None = None) -> None:
+        """Failure injection — lands in the same code path as a real event."""
+        objs = self.state.scene.objects
+        if kind == "object_removed" and target_id:
+            for o in objs:
+                if o.id == target_id:
+                    o.visible = False
+                    o.confidence = 0.0
+        elif kind == "wrong_object_move" and target_id:
+            zones = self.state.scene.zones
+            if zones:
+                wrong = random.choice(zones)
+                for o in objs:
+                    if o.id == target_id:
+                        cx = wrong.bounds.x + wrong.bounds.w / 2
+                        cy = wrong.bounds.y + wrong.bounds.h / 2
+                        o.position = Vec2(x=cx, y=cy)
+                        o.zone = wrong.id
+                        o.confidence = 0.9
+        elif kind == "verification_regress" and target_id:
+            for o in objs:
+                if o.id == target_id:
+                    o.zone = "field"
+        elif kind == "zone_blocked" and target_id:
+            for z in self.state.scene.zones:
+                if z.id == target_id:
+                    z.status = "critical"
+        elif kind == "vision_degraded":
+            for o in objs:
+                o.confidence = round(o.confidence * 0.5, 2)
+        self.state.world.objects = objs
+        self.state.mark_world_dirty()

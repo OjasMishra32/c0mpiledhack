@@ -1,120 +1,224 @@
-"""World model — merges the active observation source into the scene.
+"""Owns the merge of every observation source into state.scene / state.world.
 
-OWNER: Steven. This is the seam the orchestrator calls every tick. It must be
-synchronous, non-blocking, and must never raise.
-
-Live-camera discovery/tracking lands in scene_discovery.py and plugs in here.
+Object identity is never re-keyed by color — obj.id is the identity, the
+descriptor is an attribute that can drift with lighting. See Steven.md §5.
 """
-
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-import time
-from typing import Any
+from pathlib import Path
 
-from ..demo.simulator import classify_zone, simulator
-from ..models import Point, now_iso
+import numpy as np
 
-log = logging.getLogger("hive.world")
+from app.models import Bounds, Descriptor, ObservedObject, Vec2, Zone, utc_now
+from app.state import HiveState
+from app.vision.scene_discovery import (
+    Detection,
+    ProposedZone,
+    SceneDiscovery,
+    StableTracker,
+    associate,
+    detect_zones,
+)
 
-# Host-assisted observations win over tracking for a short window.
-_overrides: dict[str, float] = {}
-_OVERRIDE_TTL = 20.0
+log = logging.getLogger("hive.vision.world_model")
 
+MISSING_CONFIDENCE_DECAY = 0.08
+MISSING_FLAG_THRESHOLD = 0.25
+HYSTERESIS = 0.02
+EMA_ALPHA = 0.15  # slow-EMA the hue; objects don't change color, but lighting drifts
 
-def host_override(object_id: str) -> None:
-    _overrides[object_id] = time.monotonic()
-
-
-def _override_active(object_id: str) -> bool:
-    t = _overrides.get(object_id)
-    return t is not None and (time.monotonic() - t) < _OVERRIDE_TTL
-
-
-def refresh(state: Any) -> bool:
-    """Update scene objects in place from the active source. Returns True if changed."""
-    try:
-        mode = state.world.mode
-        if mode == "simulation" or not state.world.camera_online:
-            changed = simulator.step(state.scene)
-        else:
-            from .camera import camera
-            from .scene_discovery import discovery
-
-            frame = camera.latest()
-            if frame is None:
-                return simulator.step(state.scene)
-            detections = discovery.discover(frame)
-            changed = ingest(state, detections)
-            state.world.vision_fps = camera.fps
-            state.world.last_frame_at = now_iso()
-
-        for z in state.scene.zones:
-            z.occupancy = [o.id for o in state.scene.objects if o.zone == z.id]
-        return changed
-    except Exception:
-        log.exception("world_model.refresh")
-        return False
+PROFILE_PATH = Path(__file__).resolve().parents[3] / "scene_profile.json"
 
 
-def ingest(state: Any, detections: list[Any]) -> bool:
-    """Associate detections to tracked objects. Ids are stable; colour is an attribute."""
-    from .scene_discovery import associate, register_new_object, stable_filter
+def _next_object_id(existing: list[ObservedObject]) -> str:
+    nums = [int(o.id.split("_")[1]) for o in existing if o.id.startswith("obj_") and o.id.split("_")[1].isdigit()]
+    return f"obj_{(max(nums) + 1) if nums else 1}"
 
-    changed = False
-    matches = associate(detections, state.scene.objects)
 
-    for obj in state.scene.objects:
-        if _override_active(obj.id):
-            continue
-        det = matches.get(obj.id)
-        if det is None:
-            obj.visible = False
-            obj.confidence = max(0.0, obj.confidence - 0.08)  # decay, don't snap to zero
-            changed = True
-            continue
-        smoothed = stable_filter.update(obj.id, det)
-        if smoothed is None:
-            continue
-        obj.position = smoothed.position
-        obj.confidence = smoothed.confidence
-        obj.visible = True
-        obj.source = "vision"
-        obj.last_updated_at = now_iso()
-        new_zone = classify_zone(state.scene, obj.position, margin=0.0)
-        if new_zone != obj.zone and smoothed.settled:
-            obj.zone = new_zone
-        changed = True
+def merge_descriptor(old: Descriptor, det: Detection) -> Descriptor:
+    h_old, s_old, v_old = old.dominant_hsv
+    h_new, s_new, v_new = det.dominant_hsv
+    h = round(h_old * (1 - EMA_ALPHA) + h_new * EMA_ALPHA)
+    s = round(s_old * (1 - EMA_ALPHA) + s_new * EMA_ALPHA)
+    v = round(v_old * (1 - EMA_ALPHA) + v_new * EMA_ALPHA)
+    return det.to_descriptor().model_copy(update={"dominant_hsv": [h, s, v]})
 
-    matched = set(matches.keys())
-    for det in detections:
-        if getattr(det, "_matched_to", None) in matched:
-            continue
-        if getattr(det, "_matched_to", None) is None:
-            obj = register_new_object(state.scene, det)
-            obj.zone = classify_zone(state.scene, obj.position)
-            state.emit_soon(
+
+def _contains(bounds: Bounds, p: Vec2, margin: float = 0.0) -> bool:
+    """Bounds.contains() (models.py) has no margin param — this is the
+    hysteresis-aware version used only here, so raising/lowering the margin
+    doesn't change behavior for other consumers of the shared Bounds type."""
+    return (
+        bounds.x - margin <= p.x <= bounds.x + bounds.w + margin
+        and bounds.y - margin <= p.y <= bounds.y + bounds.h + margin
+    )
+
+
+class WorldModel:
+    def __init__(self, state: HiveState) -> None:
+        self.state = state
+        self.discovery = SceneDiscovery()
+        self.stable = StableTracker()
+        self._camera_fingerprint: str | None = None
+
+    # ---- ingest: called every vision tick with fresh detections -------------
+    def ingest(self, detections: list[Detection]) -> None:
+        scene = self.state.scene
+        existing_positions = {o.id: o.position for o in scene.objects}
+        matches = associate(detections, existing_positions)
+
+        used_indices: set[int] = set()
+        for obj in scene.objects:
+            if self.state.override_active(obj.id):
+                continue  # assisted mode wins for the override's TTL
+
+            idx = matches.get(obj.id)
+            if idx is None:
+                obj.visible = False
+                obj.confidence = max(0.0, obj.confidence - MISSING_CONFIDENCE_DECAY)
+                if obj.confidence < MISSING_FLAG_THRESHOLD and obj.held_by is None:
+                    self._flag_missing(obj)
+                continue
+
+            used_indices.add(idx)
+            det = detections[idx]
+            smoothed = self.stable.update(obj.id, det)
+            if smoothed is None:
+                continue
+            obj.position = smoothed.position
+            obj.confidence = smoothed.confidence
+            obj.visible = True
+            obj.descriptor = merge_descriptor(obj.descriptor, det)
+
+            new_zone = self.classify_zone(smoothed.position, current=obj.zone)
+            if new_zone != obj.zone and smoothed.settled:
+                prev = obj.zone
+                obj.zone = new_zone
+                self.state.emit_nowait(
+                    "zone_change",
+                    f"{obj.display_label()} moved from {prev} to {new_zone}.",
+                    severity="info",
+                    metadata={"object_id": obj.id, "from": prev, "to": new_zone},
+                )
+            obj.last_updated_at = utc_now()
+            obj.source = "vision"
+
+        for i, det in enumerate(detections):
+            if i in used_indices:
+                continue
+            obj = self._register_new_object(det)
+            scene.objects.append(obj)
+            self.state.emit_nowait(
                 "object_appeared",
-                f"New item detected in {state.zone_label(obj.zone)}: {obj.display_label()}.",
+                f"New object detected in {obj.zone}: {obj.display_label()}.",
                 severity="warn",
-                object_id=obj.id,
+                metadata={"object_id": obj.id},
             )
-            changed = True
-    return changed
 
+        scene.object_count = len(scene.objects)
+        self.state.world.objects = scene.objects
+        self.state.mark_world_dirty()
 
-def set_object_position(state: Any, object_id: str, position: Point) -> None:
-    """Host-assisted observation / manual placement."""
-    host_override(object_id)
-    simulator.place(state.scene, object_id, position)
-    obj = state.scene.by_id(object_id)
-    if obj:
-        obj.source = "host_override"
-        obj.confidence = 1.0
+    def _register_new_object(self, det: Detection) -> ObservedObject:
+        oid = _next_object_id(self.state.scene.objects)
+        return ObservedObject(
+            id=oid,
+            descriptor=det.to_descriptor(),
+            position=det.position,
+            zone=self.classify_zone(det.position),
+            visible=True,
+            confidence=det.confidence,
+            source="vision",
+        )
 
+    def _flag_missing(self, obj: ObservedObject) -> None:
+        self.state.emit_nowait(
+            "object_missing",
+            f"{obj.display_label()} is no longer visible.",
+            severity="warn",
+            metadata={"object_id": obj.id},
+        )
 
-def set_object_zone(state: Any, object_id: str, zone_id: str) -> None:
-    z = state.scene.zone_by_id(zone_id)
-    if not z:
-        return
-    set_object_position(state, object_id, z.bounds.center)
+    # ---- zones ----------------------------------------------------------
+    def classify_zone(self, p: Vec2, current: str | None = None) -> str:
+        """`current`, if given, gets a sticky +HYSTERESIS margin (stays put on a
+        border). Any other zone needs the object -HYSTERESIS *inside* its bounds
+        to be assigned — an object sitting on a taped line does not flap zones."""
+        if current and current != "field":
+            cur = next((z for z in self.state.scene.zones if z.id == current), None)
+            if cur and _contains(cur.bounds, p, margin=HYSTERESIS):
+                return current
+        for z in self.state.scene.zones:
+            if _contains(z.bounds, p, margin=-HYSTERESIS):
+                return z.id
+        return "field"
+
+    def detect_zones_from_frame(self, frame: np.ndarray) -> list[dict]:
+        proposed = detect_zones(frame)
+        return [{"bounds": p.bounds, "confidence": p.confidence} for p in proposed]
+
+    def define_zone(self, zone_id: str | None, bounds: tuple[float, float, float, float],
+                     label: str, source: str = "drawn") -> Zone:
+        x, y, w, h = bounds
+        zid = zone_id or f"zone_{len(self.state.scene.zones) + 1}"
+        zone = Zone(id=zid, label=label, bounds=Bounds(x=x, y=y, w=w, h=h), source=source)
+        self.state.scene.zones = [z for z in self.state.scene.zones if z.id != zid] + [zone]
+        self.state.world.zones = self.state.scene.zones
+        self.state.mark_world_dirty()
+        return zone
+
+    # ---- full rescan ------------------------------------------------------
+    def rebuild_scene(self, frame: np.ndarray) -> None:
+        """Full re-discovery: drop tracked object identity and start fresh
+        (used by /api/vision/scan)."""
+        detections = self.discovery.discover(frame)
+        self.stable = StableTracker()
+        objects = []
+        for i, det in enumerate(detections, start=1):
+            objects.append(ObservedObject(
+                id=f"obj_{i}",
+                descriptor=det.to_descriptor(),
+                position=det.position,
+                zone=self.classify_zone(det.position),
+                visible=True,
+                confidence=det.confidence,
+                source="vision",
+            ))
+        self.state.scene.objects = objects
+        self.state.scene.object_count = len(objects)
+        self.state.scene.scanned_at = utc_now()
+        self.state.scene.stable = False
+        self.state.world.objects = objects
+        self.state.mark_world_dirty()
+
+    def mark_scene_stable(self) -> None:
+        self.state.scene.stable = True
+
+    # ---- persistence --------------------------------------------------
+    def fingerprint(self, frame: np.ndarray) -> str:
+        small = frame[::8, ::8].mean(axis=2).astype(np.uint8)
+        return hashlib.sha1(small.tobytes()).hexdigest()[:12]
+
+    def save_profile(self, frame: np.ndarray | None = None) -> None:
+        data = {
+            "fingerprint": self._camera_fingerprint,
+            "zones": [z.model_dump() for z in self.state.scene.zones],
+        }
+        PROFILE_PATH.write_text(json.dumps(data, indent=2))
+
+    def load_profile(self, frame: np.ndarray | None = None) -> bool:
+        if not PROFILE_PATH.exists():
+            return False
+        try:
+            data = json.loads(PROFILE_PATH.read_text())
+            zones = [Zone.model_validate(z) for z in data.get("zones", [])]
+            self.state.scene.zones = zones
+            self.state.world.zones = zones
+            self._camera_fingerprint = data.get("fingerprint")
+            return True
+        except Exception:
+            log.exception("failed to load scene_profile.json")
+            return False

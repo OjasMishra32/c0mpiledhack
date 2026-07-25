@@ -49,6 +49,12 @@ _candidates: dict[str, int] = {}
 _disconnect_since: dict[str, float] = {}
 
 
+def reset() -> None:
+    """Clear debounce and grace-period state so a reset run starts clean."""
+    _candidates.clear()
+    _disconnect_since.clear()
+
+
 def _debounce(key: str) -> bool:
     """Require N consecutive ticks before a trigger fires. One flaky read must never
     put a red banner on the projector."""

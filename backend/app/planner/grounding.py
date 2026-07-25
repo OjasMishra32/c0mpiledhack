@@ -40,6 +40,7 @@ HUE_NAMES: dict[str, tuple[tuple[int, int], ...]] = {
 }
 
 COLOR_SYNONYMS: dict[str, str] = {
+    "indigo": "purple",  # the vision namer emits this at hue ~135
     "crimson": "red",
     "scarlet": "red",
     "maroon": "red",
@@ -523,8 +524,13 @@ def _score(phrase: str, obj: ObservedObject, scene: Scene) -> tuple[float, list[
     # colour — 0.40
     want = _phrase_colors(toks)
     if want:
-        have = obj.descriptor.color_name
-        if have in want:
+        # Normalize BOTH sides through the synonym map. The vision namer emits names like
+        # "teal" and "lime" that this vocabulary treats as synonyms of cyan and green — so
+        # without this, HIVE would print "teal item" on screen and then fail to understand
+        # an operator saying "the teal item".
+        raw = obj.descriptor.color_name
+        have = COLOR_SYNONYMS.get(raw, raw)
+        if have in want or raw in want:
             score += 0.40
             basis.append("colour match")
         elif want & COLOR_ADJACENCY.get(have, set()):

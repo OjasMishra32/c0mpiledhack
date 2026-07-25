@@ -15,7 +15,7 @@ from .config import settings
 from .models import Evidence, Goal, Point, now_iso
 from .planner.base import NotReady, compile_goal
 from .state import state
-from .vision import world_model
+from .vision import bridge as world_model
 from .websocket_manager import ws
 
 log = logging.getLogger("hive.host")
@@ -79,15 +79,21 @@ async def h_compile_goal(p: dict[str, Any]) -> None:
 
 
 def _ambiguity_payload(grounding: Any) -> dict[str, Any]:
+    """Normalize whichever ambiguity shape grounding reports into the host payload."""
     amb = list(getattr(grounding, "ambiguous", []) or [])
     if not amb:
         return {"phrase": "", "candidates": [], "message": "Identify the intended item."}
-    b = amb[0]
-    cands = [b.object_id] + list(getattr(b, "alternatives", []) or []) if b.object_id else []
+    a = amb[0]
+    phrase = getattr(a, "phrase", "") or ""
+    candidates = list(getattr(a, "candidates", None) or [])
+    if not candidates:  # Binding-shaped: a best guess plus runners-up
+        best = getattr(a, "object_id", None)
+        candidates = ([best] if best else []) + list(getattr(a, "alternatives", []) or [])
     return {
-        "phrase": b.phrase,
-        "candidates": [c for c in cands if c],
-        "message": f"Multiple items match \u201c{b.phrase}\u201d. Select the intended one.",
+        "phrase": phrase,
+        "candidates": [c for c in candidates if c],
+        "message": getattr(a, "message", "")
+        or f"Multiple items match \u201c{phrase}\u201d. Select the intended one.",
     }
 
 
@@ -215,20 +221,7 @@ async def h_emergency(p: dict[str, Any]) -> None:
 
 
 async def h_scan_scene(p: dict[str, Any]) -> None:
-    from .vision.camera import camera
-    from .vision.scene_discovery import discovery, rebuild_scene
-
-    if state.world.mode != "simulation" and camera.online:
-        frame = camera.latest()
-        if frame is not None:
-            rebuild_scene(state.scene, discovery.discover(frame))
-    else:
-        from .demo.simulator import simulator
-
-        simulator.spawn_scene(state.scene)
-
-    world_model.refresh(state)
-    n = len(state.scene.objects)
+    n = world_model.scan(state)
     await ws.broadcast_host("scene_discovered", state.scene.model_dump())
     await state.emit(
         "scene_discovered",
@@ -237,7 +230,6 @@ async def h_scan_scene(p: dict[str, Any]) -> None:
         severity="success",
         count=n,
     )
-
     if p.get("relabel", True):
         await _relabel_scene()
 
@@ -245,11 +237,10 @@ async def h_scan_scene(p: dict[str, Any]) -> None:
 async def _relabel_scene() -> None:
     """Semantic labelling — one burst, on scan only, never on a timer."""
     from .perception.analyzer import analyzer
-    from .vision.camera import camera
 
-    if not analyzer.enabled or not camera.online:
+    if not analyzer.enabled or not world_model.camera_online():
         return
-    frames = camera.burst(count=2, seconds=1.0)
+    frames = world_model.burst(count=2, seconds=1.0)
     if not frames:
         return
     a = await analyzer.describe(frames)
@@ -305,12 +296,11 @@ async def h_bind_object(p: dict[str, Any]) -> None:
 async def h_ask_feed(p: dict[str, Any]) -> None:
     """Operator Q&A over the live camera. The clearest proof this is real perception."""
     from .perception.analyzer import analyzer
-    from .vision.camera import camera
 
     question = (p.get("question") or "").strip()
     if not question:
         return
-    frames = camera.burst(count=settings.vlm_burst_frames, seconds=2.5)
+    frames = world_model.burst(count=settings.vlm_burst_frames, seconds=2.5)
     if not analyzer.enabled or not frames:
         await ws.broadcast_host(
             "feed_answer",
@@ -354,9 +344,7 @@ async def h_set_mode(p: dict[str, Any]) -> None:
         return
     state.world.mode = mode  # type: ignore[assignment]
     if mode in ("live", "assisted"):
-        from .vision.camera import camera
-
-        ok = camera.open()
+        ok = world_model.open_camera()
         state.world.camera_online = ok
         if not ok:
             state.world.mode = "simulation"

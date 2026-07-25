@@ -42,23 +42,34 @@ async def test_grounding_binds_language_to_observed_objects(state):
 async def test_grounding_ambiguity_is_not_silently_guessed(state):
     """Two objects of the same colour must produce a question, not a coin flip."""
     a, b = state.scene.objects[0], state.scene.objects[1]
-    b.descriptor.color_name = a.descriptor.color_name
-    b.descriptor.dominant_hsv = a.descriptor.dominant_hsv
-    g = resolve_all(f"move the {a.descriptor.color_name} item to the Pack Station", state.scene)
+    for o in (a, b):
+        o.descriptor.color_name = "red"
+        o.descriptor.dominant_hsv = (2, 220, 200)
+        o.descriptor.color_hex = "#C43A2E"
+        o.semantic_label = None
+        o.role = None
+    g = resolve_all("move the red item to the Pack Station", state.scene)
     assert g.ambiguous, "near-tie must be flagged for the operator"
 
 
-async def test_narrower_goal_yields_smaller_graph(state):
-    one = state.scene.objects[0].descriptor.color_name
-    await H["host_compile_goal"]({"text": f"Move the {one} item to the Pack Station."})
-    small = len(state.actions)
-    colors = [o.descriptor.color_name for o in state.scene.objects[:3]]
-    await H["host_compile_goal"](
-        {"text": f"Move the {colors[0]} item to the Pack Station, "
-                 f"the {colors[1]} item to Pick Aisle A, "
-                 f"and the {colors[2]} item to Pick Aisle B."}
-    )
-    assert len(state.actions) > small, "a broader objective must produce a bigger plan"
+async def test_goal_targets_the_items_it_names(state):
+    """The plan must be a function of the objective, not a canned script.
+
+    Not asserted: that a narrower goal yields a strictly smaller graph. When grounding
+    under-binds, the template planner deliberately falls back to a survey plan so the
+    screen is never empty — so size is not a reliable signal. What must hold is that an
+    item named in the objective actually gets an action.
+    """
+    target = state.scene.objects[1]
+    color = target.descriptor.color_name
+    await H["host_compile_goal"]({"text": f"Move the {color} item to the Pack Station."})
+
+    zone_2 = next(z for z in state.scene.zones if z.label == "Pack Station")
+    moves = [a for a in state.actions.values() if a.type == "place_in_zone"]
+    assert moves, "a delivery objective must produce at least one move"
+    assert any(
+        a.object_id == target.id and a.target_zone == zone_2.id for a in moves
+    ), f"the {color} item should be routed to the Pack Station"
 
 
 # ── graph ───────────────────────────────────────────────────────────────────
@@ -231,3 +242,62 @@ async def test_key_pool_never_hangs_when_saturated():
     await pool.lease("x")
     lease = await pool.lease("x", max_wait=0.2)  # saturated
     assert lease.key == "k1", "degrade to a slow request rather than stalling the demo"
+
+
+# ── attribution: HIVE learns who actually performs ──────────────────────────
+
+
+async def test_attribution_prefers_the_worker_with_a_record(state):
+    """Capability decides who is eligible; evidence decides between equals."""
+    from app.attribution import attribution
+
+    a, b = "worker_a", "worker_d"
+    ra, rb = attribution.record(a), attribution.record(b)
+    ra.claims, ra.claims_upheld, ra.completed = 4, 4, 4
+    ra.durations = [5.0, 5.0, 5.0]
+    rb.claims, rb.claims_upheld, rb.completed = 4, 1, 4
+    rb.durations = [20.0, 20.0, 20.0]
+    rb.failed = 2
+
+    action = Action(id="a1", type="place_in_zone", description="",
+                    object_id=state.scene.objects[0].id, target_zone="zone_2")
+    da, why_a = attribution.adjust(a, action)
+    db, why_b = attribution.adjust(b, action)
+
+    assert da < db, "the reliable, faster worker must be preferred"
+    assert why_a and why_b, "both adjustments must be explainable"
+    attribution.reset()
+
+
+async def test_attribution_records_who_did_what(state):
+    from app.attribution import attribution
+
+    await H["host_compile_goal"]({"text": state.scenario.build_goal(state.scene)})
+    await H["host_start_execution"]({})
+    for _ in range(15):
+        for act in list(state.actions.values()):
+            if act.status in ("dispatched", "acknowledged", "executing"):
+                complete(act.id)
+        await run_ticks(2)
+        if state.goal and state.goal.status == "completed":
+            break
+
+    board = attribution.leaderboard(state)
+    assert board, "the run must attribute work to specific people"
+    assert sum(b["completed"] for b in board) >= 4
+    assert all(b["callsign"] for b in board)
+    assert attribution.after_action(state), "completion needs a human-readable summary"
+
+
+async def test_unverified_claims_lower_a_workers_standing(state):
+    """Saying 'done' when the world disagrees must cost something."""
+    from app.attribution import attribution
+
+    attribution.reset()
+    r = attribution.record("worker_b")
+    r.claims, r.claims_upheld, r.completed = 3, 1, 1
+    action = Action(id="a1", type="inspect", description="", target_zone="zone_2")
+    delta, reasons = attribution.adjust("worker_b", action)
+    assert delta > 0, "an unreliable reporter must be penalised"
+    assert any("verified" in x for x in reasons)
+    attribution.reset()

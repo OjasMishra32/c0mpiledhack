@@ -9,6 +9,7 @@ Rules that hold this together:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import deque
@@ -58,6 +59,7 @@ class HiveState:
         self.pending_grounding: dict[str, Any] | None = None
         self.escalation_armed: bool = False
         self.last_call: dict[str, Any] | None = None
+        self.host_overrides: dict[str, Any] = {}
         self._seq = 0
         self._lock = asyncio.Lock()
         self._started_monotonic: float | None = None
@@ -135,6 +137,46 @@ class HiveState:
         self._pending_events.append(ev)
         return ev
 
+    # ── vision-facing helpers ───────────────────────────────────────────────
+
+    def override_active(self, object_id: str) -> bool:
+        """True while a host-assisted observation for this object still stands.
+
+        An operator correcting the model outranks the tracker for a short window; the
+        bridge owns the TTL so both call sites agree.
+        """
+        from .vision import bridge
+
+        return bridge.override_active(object_id)
+
+    def set_host_override(self, object_id: str) -> None:
+        from .vision import bridge
+
+        bridge._overrides[object_id] = __import__("time").monotonic()
+
+    def mark_world_dirty(self) -> None:
+        """Flag the world as changed. Broadcasts are coalesced by the tick rather than
+        pushed per-change, so the vision loop can call this freely at 10-20 Hz."""
+        from .websocket_manager import ws
+
+        ws.mark_world_dirty()
+
+    def consume_dirty(self) -> bool:
+        from .websocket_manager import ws
+
+        was = ws._world_dirty
+        ws._world_dirty = False
+        return was
+
+    def emit_nowait(self, type: str, message: str, severity: str = "info",
+                    actor: str = "vision", metadata: dict | None = None) -> None:
+        """Fire-and-forget emit for synchronous hot paths (the vision tick).
+
+        Same sequence counter as emit()/emit_soon(), so ordering stays gap-free across
+        every producer; the tick flushes it with everything else.
+        """
+        self.emit_soon(type, message, severity=severity, actor=actor, **(metadata or {}))
+
     def drain_pending_events(self) -> list[Event]:
         out, self._pending_events = self._pending_events, []
         return out
@@ -180,9 +222,22 @@ class HiveState:
         self._started_monotonic = None
         self._apply_scenario(scenario)
 
-        from .demo.simulator import simulator
+        # Reset must be TOTAL. Every module that keeps state between ticks gets cleared,
+        # or a second run inherits the first one's debounce counters, locks and overrides.
+        # We press this button a dozen times during a demo.
+        from . import recovery, scheduler
+        from .attribution import attribution
+        from .integrations import voygr
+        from .vision import bridge
 
-        simulator.spawn_scene(self.scene)
+        bridge.reset()
+        recovery.reset()
+        attribution.reset()
+        voygr.reset_cooldown()
+        with contextlib.suppress(Exception):
+            scheduler.reset()
+
+        bridge.scan(self)
 
         for w in self.workers.values():
             w.status = "ready" if w.connected else "disconnected"
@@ -252,12 +307,19 @@ class HiveState:
             "world": self.world.model_dump(),
             "locks": self.locks,
             "metrics": self.metrics.model_dump(),
+            "contributions": _contributions(self),
             "events": [e.model_dump() for e in list(self.events)[-200:]],
             "pending_grounding": self.pending_grounding,
             "escalation_armed": self.escalation_armed,
             "last_call": self.last_call,
             "demo_mode": settings.demo_mode,
         }
+
+
+def _contributions(s: "HiveState") -> list[dict[str, Any]]:
+    from .attribution import attribution
+
+    return attribution.leaderboard(s)
 
 
 state = HiveState()

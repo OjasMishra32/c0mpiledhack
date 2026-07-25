@@ -13,7 +13,8 @@ from app import orchestrator  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.models import InboundMessage  # noqa: E402
 from app.state import state as _state  # noqa: E402
-from app.vision import world_model  # noqa: E402
+from app.vision import bridge as world_model  # noqa: E402
+from app.websocket_manager import ws  # noqa: E402
 
 # Tests must never depend on a network, a key, or a camera.
 settings.nvidia_api_key = None

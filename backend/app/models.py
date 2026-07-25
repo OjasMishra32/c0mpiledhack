@@ -169,13 +169,8 @@ class ObservedObject(_Base):
     locked_by: str | None = None
 
     def display_label(self) -> str:
-        """Bare noun phrase — callers add their own article ("the {label}")."""
         if self.role:
-            r = self.role.strip()
-            for article in ("the ", "a ", "an "):
-                if r.lower().startswith(article):
-                    return r[len(article):]
-            return r
+            return self.role
         if self.semantic_label:
             return self.semantic_label
         d = self.descriptor
@@ -197,6 +192,7 @@ class Scene(_Base):
     scanned_at: str = Field(default_factory=now_iso)
     labeling_source: str = "none"  # vlm | descriptor | none
     stable: bool = True
+    object_count: int = 0
 
     def by_id(self, oid: str) -> ObservedObject | None:
         return next((o for o in self.objects if o.id == oid), None)
@@ -218,8 +214,11 @@ class Scene(_Base):
 
 
 class WorldState(_Base):
-    """Camera/vision status. The scene itself lives on HiveState."""
+    """Camera/vision status. The scene itself lives on HiveState.scene."""
 
+    # Convenience mirror of scene.objects that the vision pipeline writes. Excluded from
+    # serialization so the wire payload keeps exactly one source of truth for objects.
+    objects: list[ObservedObject] = Field(default_factory=list, exclude=True)
     mode: WorldMode = "simulation"
     camera_online: bool = False
     vision_fps: float = 0.0
@@ -427,3 +426,7 @@ class PlannerState(_Base):
 
 # Name the planner suite was authored against.
 HiveState = PlannerState
+
+
+# Alias: the vision workstream calls this one `utc_now`.
+utc_now = now_iso

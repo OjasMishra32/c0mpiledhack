@@ -41,9 +41,9 @@ async def lifespan(app: FastAPI):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
-    from .vision.camera import camera
+    from .vision import bridge
 
-    camera.release()
+    bridge.release_camera()
 
 
 async def _startup_probe() -> None:
@@ -73,11 +73,11 @@ async def _startup_probe() -> None:
     )
 
     if settings.world_mode in ("live", "assisted"):
-        from .vision.camera import camera
+        from .vision import bridge
 
         # Open during startup, never during the demo: on macOS the first read triggers
         # the permission prompt, and a permission dialog on stage is a disaster.
-        ok = await asyncio.to_thread(camera.open)
+        ok = await asyncio.to_thread(bridge.open_camera)
         state.world.camera_online = ok
         state.world.mode = settings.world_mode if ok else "simulation"  # type: ignore[assignment]
         await state.emit(
@@ -98,7 +98,7 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health():
-    from .vision.camera import camera
+    from .vision import bridge
 
     return {
         "ok": True,
@@ -106,7 +106,7 @@ async def health():
         "execution_status": state.execution_status,
         "workers_connected": sum(1 for w in state.workers.values() if w.connected),
         "scenario": state.scenario.id,
-        "camera": {"online": camera.online, "index": camera.index, "fps": camera.fps, "error": camera.error},
+        "camera": {"online": bridge.camera_online(), "index": bridge.camera().index, "fps": bridge.camera_fps()},
         "models": nim_client.health(),
         "perception": analyzer.health(),
         "planner": {"model": settings.planner_model, "mode": "template-first, model upgrade in background"},
@@ -136,30 +136,30 @@ async def scenarios():
 async def cameras():
     from .vision.camera import probe_cameras
 
-    return await asyncio.to_thread(probe_cameras)
+    return await asyncio.to_thread(probe_cameras)  # noqa: F401
 
 
 @app.post("/api/vision/select/{index}")
 async def select_camera(index: int):
-    from .vision.camera import camera
+    from .vision import bridge
 
-    ok = await asyncio.to_thread(camera.open, index)
+    ok = await asyncio.to_thread(bridge.open_camera, index)
     state.world.camera_online = ok
     if ok:
         settings.camera_index = index
         state.world.mode = "live"  # type: ignore[assignment]
-    return {"ok": ok, "index": index, "error": camera.error}
+    return {"ok": ok, "index": index}
 
 
 @app.get("/api/vision/frame.mjpg")
 async def mjpeg():
     """MJPEG chosen over WebRTC deliberately: ~20 lines, no negotiation, works everywhere."""
-    from .vision.camera import camera
+    from .vision import bridge
 
     async def gen():
         boundary = b"--frame\r\n"
         while True:
-            jpeg = camera.snapshot_jpeg()
+            jpeg = bridge.snapshot_jpeg()
             if jpeg:
                 yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
             await asyncio.sleep(1 / 15)
