@@ -8,7 +8,7 @@
 
 ```bash
 git pull --rebase origin main
-cd backend && .venv/bin/python -m pytest tests -q          # expect 110 passed
+cd backend && .venv/bin/python -m pytest tests -q          # expect 129 passed
 .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -21,10 +21,10 @@ Rebase before every session. Two other people are pushing tonight.
 Verified end to end over real sockets, not just in tests:
 
 - 5 phones connect, get distinct callsigns, refresh reclaims the same slot
-- Objective compiles to a 7-action graph, **4 executable in parallel**
+- Objective compiles to a ~9-action graph, **4 executable in parallel**, 5 stages deep
 - Private instructions dispatch — no phone ever receives the plan
 - Disable a worker mid-action → reassigned with a spoken reason → run completes
-- 110 tests pass under every `PYTHONHASHSEED`, with no key, no camera, no network
+- 129 tests pass under every `PYTHONHASHSEED`, with no key, no camera, no network
 - 3 NVIDIA keys pooled at ~114 RPM with sticky affinity and 429 cooldown
 
 **Your files:** `main · config · models · state · websocket_manager · orchestrator ·
@@ -35,49 +35,30 @@ demo/scenarios · integrations/voygr`
 
 ## What's left, in priority order
 
-### 1. Wire the reasoner into the deviation path (biggest remaining intelligence win)
+### DONE — deviation adjudication and Ask the feed are shipped
 
-`perception/analyzer.py` is built and probes itself at startup, but nothing calls
-`analyze_deviation()` yet. Right now a deviation fires purely off the tracker.
+Both are wired and tested; do not re-implement them.
 
-In `recovery.detect()`, when a deviation candidate survives debounce, hand it to the
-analyzer **before** the red banner goes up:
-
-```python
-frames = bridge.burst(count=5, seconds=2.5)
-verdict = await analyzer.analyze_deviation(expected, observed, frames)
-```
-
-`agrees=false` suppresses a false alarm. `agrees=true` fires it **and** hands Steven's
-overlay a one-sentence natural-language explanation of what actually happened. That is the
-difference between "our colour tracker flickered" and "HIVE understood that someone moved
-the scanner to the wrong aisle."
-
-This must not block the tick — kick it off as a task and let the tick continue; apply the
-verdict when it lands. The deviation overlay animates for ~600ms anyway, which covers the
-latency for free.
-
-### 2. "Ask the feed" — 20 minutes, disproportionate payoff
-
-`h_ask_feed` already exists in `host_commands.py` and works. It needs an input on the host
-(coordinate with Steven — it's one text field in the toolbar).
-
-> *"Is anyone holding the scanner right now?"* → **"Yes — the worker on the east side is
-> holding it above the pack station. It has not been set down."**
-
-If a judge asks "is this real?", hand them the keyboard. Nothing else you can build
-answers that question as completely.
+- `orchestrator._start_adjudication` sends a burst of the last ~2.5s of frames to
+  `analyzer.analyze_deviation` before any banner fires. A refuted deviation is dismissed
+  quietly; a confirmed one uses the model's own sentence as the headline. It never blocks
+  the tick and **fails open** after `ADJUDICATION_TIMEOUT` (3s) — a hung endpoint cannot
+  swallow a real deviation. Covered by `test_adjudication_fails_open_when_unavailable` and
+  `test_adjudication_suppresses_a_refuted_deviation`.
+- **Ask the feed** is in the toolbar (`AskFeed.tsx` → `host_ask_feed`). Verified against the
+  live camera: asked what was in front of the lens, it correctly reported three people and
+  no work surface.
 
 ### 3. Rehearse until you don't need the screen
 
-The 90-second script:
+**`DEMO.md` is the runbook — use that on stage.** This is the same script, kept here for context:
 
 | t | Screen | You say |
 | --- | --- | --- |
 | 0:00 | 5 nodes pulsing | "Five workers. None of them knows the full plan — each one only ever sees their next task." |
 | 0:08 | Scan Scene | "It has never seen this table. It's looking now." |
 | 0:14 | Type objective, Compile | "One sentence in." |
-| 0:20 | Graph explodes out | "Seven actions. Four run in parallel. It worked out the ordering itself." |
+| 0:20 | Graph explodes out | Read the counts off the screen — the scene is discovered fresh, so they vary. Typically nine actions, four parallel. "It worked out the ordering itself, and two of these need the same item so it sequenced them." |
 | 0:30 | Instructions land | "Private instructions. Nobody is coordinating out loud." |
 | 0:45 | **Judge moves an object** | "You're the floor. Change something." |
 | 0:50 | FLOOR STATE DEVIATION | *(say nothing for three seconds — let the screen talk)* |
