@@ -24,15 +24,20 @@ BG = (60, 60, 60)  # low-saturation plain surface
 
 
 @pytest.fixture(autouse=True)
-def isolated_bridge():
+def isolated_overrides():
     """These tests build their own HiveState + WorldModel, but `override_active`
     resolves through the bridge's process-global override map. Without this,
     an override left behind by another test file suppresses tracking for the
     same object id here and the failure looks like a tracker bug.
+
+    Scoped to that map on purpose: a full `bridge.reset()` also drops the
+    world/simulator singletons, which other suites are entitled to rely on.
     """
-    bridge.reset()
+    saved = dict(bridge._overrides)
+    bridge._overrides.clear()
     yield
-    bridge.reset()
+    bridge._overrides.clear()
+    bridge._overrides.update(saved)
 
 
 def make_frame(blobs, size=(W, H), bg=BG):
