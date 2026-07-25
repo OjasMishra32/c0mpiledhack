@@ -27,8 +27,12 @@ demo: ## full demo mode: simulated workers, no camera or keys needed
 	DEMO_MODE=true WORLD_MODE=simulation $(MAKE) dev
 
 test:
-	$(VENV)/bin/pytest backend/tests -q
+	cd backend && .venv/bin/pytest tests -q
+	cd frontend && npx tsc --noEmit
 	cd frontend && npm run test --if-present
+
+live: ## dev environment with the camera on
+	WORLD_MODE=live $(MAKE) dev
 
 ip: ## print the join URL for phones
 	@$(PY) -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print('  join → http://%s:5173/join' % s.getsockname()[0]);s.close()"

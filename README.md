@@ -175,12 +175,17 @@ An LLM in the inner loop is a demo that hangs on stage.
 
 ```bash
 make install     # backend venv + frontend node_modules
-make dev         # backend :8000 + frontend :5173, prints your LAN join URL
-make test        # pytest + vitest
-make demo        # dev environment with DEMO_MODE=true and simulated workers
+make dev         # backend :8000 + frontend :5173
+make live        # same, with the camera on
+make test        # backend pytest + frontend typecheck
+make ip          # print the join URL to point phones at
 ```
 
-Open **http://localhost:5173/host** on the laptop. Point phones at the QR code.
+Open **http://localhost:5173/host**. The frontend proxies `/api` and `/ws` to the backend,
+so the host and every phone share one origin — one URL to explain, no CORS, no mixed
+content.
+
+Then, on the host page: **Scan scene** → type an objective → **Compile** → **Start**.
 
 Works with no API key. Works with no camera. Works with no phones.
 
@@ -218,6 +223,7 @@ Copy `.env.example` → `.env`. Every variable has a working default; none are r
 | What broke | What HIVE does | What you do |
 | --- | --- | --- |
 | No API key / LLM down | Template planner, identical graph | Nothing. Say "plan compiled from the operations template library." |
+| Camera index changed | Falls back to any device that produces a frame, logs which | Nothing — capture indices shift whenever anything is replugged |
 | Camera missing/denied | Auto-switch to simulation, banner shows mode | Nothing. Drag objects in the world view. |
 | VLM endpoint down/slow | One `warn` event, then silence. CV tracker carries verification. | Nothing. Semantics degrade, coordination doesn't. |
 | Vision misreads an object | Assisted mode: click the true position on the feed | Click it. Logs "host-assisted observation." |
