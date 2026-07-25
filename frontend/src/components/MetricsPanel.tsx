@@ -3,7 +3,6 @@ import { useEffect, useState } from 'react';
 interface Metric {
   value: number;
   label: string;
-  sublabel: string;
 }
 
 interface MetricsPanelProps {
@@ -29,35 +28,29 @@ function useCountUp(target: number, durationMs = 600) {
   return value;
 }
 
-function CountStat({ target, label, sublabel }: { target: number; label: string; sublabel: string }) {
+function CountStat({ target, label }: { target: number; label: string }) {
   const value = useCountUp(target);
   return (
-    <div className="flex flex-col items-center gap-1">
-      <span className="font-mono text-[64px] font-light leading-none tracking-[-0.03em] text-fg-0">{value}</span>
-      <span className="text-center text-[11px] font-semibold uppercase tracking-[0.14em] text-fg-2">
-        {label}
-        <br />
-        {sublabel}
-      </span>
+    <div className="flex flex-col items-center gap-0.5">
+      <span className="tabular-nums text-[32px] font-semibold text-text-primary">{value}</span>
+      <span className="text-[12px] text-text-tertiary">{label}</span>
     </div>
   );
 }
 
 export function MetricsPanel({ metrics, totalTime, meanConfidence, idleReduction }: MetricsPanelProps) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-10 bg-bg-0">
-      <span className="text-[11px] font-semibold uppercase tracking-[0.2em] text-fg-2">
-        Incident Stabilized
-      </span>
-      <div className="grid grid-cols-3 gap-x-12 gap-y-8 sm:grid-cols-6">
+    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-8 bg-background/95">
+      <span className="text-[17px] font-semibold text-text-primary">Objective complete</span>
+      <div className="grid grid-cols-3 gap-x-10 gap-y-6 sm:grid-cols-6">
         {metrics.map((m) => (
-          <CountStat key={m.label} target={m.value} label={m.label} sublabel={m.sublabel} />
+          <CountStat key={m.label} target={m.value} label={m.label} />
         ))}
       </div>
-      <div className="flex items-center gap-6 text-[13px] text-fg-1">
-        <span className="font-mono">⏱ {totalTime} total</span>
-        <span>◈ {Math.round(meanConfidence * 100)}% mean verification confidence</span>
-        <span>↓ {Math.round(idleReduction * 100)}% responder idle time</span>
+      <div className="flex items-center gap-6 text-[13px] text-text-secondary">
+        <span className="tabular-nums">{totalTime} total</span>
+        <span>{Math.round(meanConfidence * 100)}% mean verification confidence</span>
+        <span>{Math.round(idleReduction * 100)}% less responder idle time</span>
       </div>
     </div>
   );

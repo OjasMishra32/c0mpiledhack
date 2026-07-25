@@ -1,115 +1,161 @@
 import { useState } from 'react';
-import { AdvancedControls } from '../components/AdvancedControls';
-import { EventTimeline } from '../components/EventTimeline';
-import { GoalBar } from '../components/GoalBar';
+import { DeviationBanner } from '../components/DeviationBanner';
+import { Inspector, type Selection } from '../components/Inspector';
 import { MetricsPanel } from '../components/MetricsPanel';
+import { Sidebar } from '../components/Sidebar';
 import { TaskGraph } from '../components/TaskGraph';
-import { WorkerGrid } from '../components/WorkerGrid';
-import { WorldView } from '../components/WorldView';
-import { ZonePanel } from '../components/ZonePanel';
-import { Chip, Panel, Pulse, Rule } from '../components/primitives';
+import { Timeline } from '../components/Timeline';
+import { Toolbar } from '../components/Toolbar';
+import { WorldView, type ActivePath } from '../components/WorldView';
 import { dummyActions, dummyEvents, dummyObjects, dummyWorkers, dummyZones } from '../lib/dummyData';
 
+type DeviationPhase = 'detected' | 'evaluating' | 'reassigning' | 'resumed';
+
+const DUMMY_DEVIATION = {
+  expected: 'Handheld scanner · Pack Station',
+  observed: 'Handheld scanner · Pick Aisle A',
+  message: 'Handheld scanner is outside the planned route. Packing workflow blocked.',
+  action_ids: ['a3'],
+};
+
+const DUMMY_RECOVERY = { summary: 'Reassigning retrieval to Delta. Picking and restock continued uninterrupted.' };
+
 export function Host() {
+  const [selection, setSelection] = useState<Selection>(null);
+  const [graphOpen, setGraphOpen] = useState(false);
   const [showMetrics] = useState(false);
-  const connectedCount = dummyWorkers.filter((w) => w.connected).length;
+  const [deviationPhase, setDeviationPhase] = useState<DeviationPhase | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+
+  function triggerDeviation() {
+    setDeviationPhase('detected');
+    setTimeout(() => setDeviationPhase('evaluating'), 1200);
+    setTimeout(() => setDeviationPhase('reassigning'), 2400);
+    setTimeout(() => setDeviationPhase('resumed'), 3600);
+    setTimeout(() => setDeviationPhase(null), 6000);
+  }
+
+  const goal = {
+    id: 'goal_1',
+    raw_text: 'Fulfill expedited order 4471 at the pack station and restock Pick Aisle B.',
+    normalized_intent: 'fulfill_order',
+    status: 'executing' as const,
+    success_predicates: [],
+    plan_source: 'llm' as const,
+    planner_notes: '5 actions, 2 parallelizable, 1 resource conflict identified.',
+    created_at: new Date().toISOString(),
+  };
+
+  const connectedWorkers = dummyWorkers.filter((w) => w.connected).length;
+
+  const activePaths: ActivePath[] = dummyActions
+    .filter((a) => (a.status === 'executing' || a.status === 'dispatched') && a.object_id && a.target_zone)
+    .map((a) => {
+      const zone = dummyZones.find((z) => z.id === a.target_zone);
+      const worker = dummyWorkers.find((w) => w.id === a.assigned_worker_id);
+      return {
+        id: a.object_id!,
+        from: [0, 0] as [number, number],
+        to: zone ? [zone.bounds.x + zone.bounds.w / 2, zone.bounds.y + zone.bounds.h / 2] : [0.5, 0.5],
+        color: worker?.color,
+      };
+    });
+
+  function selectionFromWorker(id: string | null): void {
+    setSelection(id ? { kind: 'worker', id } : null);
+  }
 
   return (
-    <div className="flex h-screen w-screen flex-col bg-line">
-      {/* header */}
-      <header className="flex h-14 items-center gap-4 bg-bg-0 px-4">
-        <span className="text-[13px] font-semibold uppercase tracking-[0.2em] text-fg-0">HIVE</span>
-        <div className="flex items-center gap-2">
-          <Pulse color="var(--ok)" size={8} />
-          <span className="text-[11px] uppercase tracking-[0.1em] text-fg-2">
-            Collective Online · {connectedCount} Nodes
-          </span>
-        </div>
-        <Chip tone="info" className="ml-auto">Mode: Live</Chip>
-        <span className="font-mono text-[13px] text-fg-2">00:47</span>
-      </header>
+    <div className="flex h-screen w-screen flex-col bg-background">
+      <Toolbar
+        goal={goal}
+        connectedWorkers={connectedWorkers}
+        totalWorkers={dummyWorkers.length}
+        mode="live"
+        executing
+        onOpenGraph={() => setGraphOpen((v) => !v)}
+        onOpenInspector={() => setInspectorOpen((v) => !v)}
+      />
 
-      {/* body — three columns, 1px hairline gap via bg-line background */}
-      <div className="grid min-h-0 flex-1 grid-cols-[320px_1fr_380px] gap-px overflow-hidden">
-        {/* left: workers + scene */}
-        <div className="flex min-h-0 flex-col gap-px overflow-hidden bg-line">
-          <Panel label="Workers" className="flex-none" scroll>
-            <WorkerGrid workers={dummyWorkers} />
-          </Panel>
-          <Rule />
-          <Panel className="min-h-0 flex-1" scroll>
-            <ZonePanel objects={dummyObjects} zones={dummyZones} />
-          </Panel>
-        </div>
+      <div className="grid min-h-0 flex-1 grid-cols-[240px_1fr] xl:grid-cols-[280px_1fr_320px]">
+        <Sidebar
+          goal={goal}
+          actions={dummyActions}
+          workers={dummyWorkers}
+          selectedWorkerId={selection?.kind === 'worker' ? selection.id : null}
+          onSelectWorker={selectionFromWorker}
+        />
 
-        {/* center: objective + graph + world view (or metrics on completion) */}
-        <div className="flex min-h-0 flex-col gap-px overflow-hidden bg-line">
-          {showMetrics ? (
+        <div className="relative min-h-0 border-r border-separator">
+          <WorldView
+            objects={dummyObjects}
+            zones={dummyZones}
+            activePaths={activePaths}
+            selectedObjectId={selection?.kind === 'object' ? selection.id : null}
+            onSelectObject={(id) => setSelection(id ? { kind: 'object', id } : null)}
+            selectedZoneId={selection?.kind === 'zone' ? selection.id : null}
+            onSelectZone={(id) => setSelection(id ? { kind: 'zone', id } : null)}
+          />
+
+          {deviationPhase && (
+            <DeviationBanner deviation={DUMMY_DEVIATION} phase={deviationPhase} recovery={deviationPhase === 'resumed' ? DUMMY_RECOVERY : null} />
+          )}
+
+          {graphOpen && (
+            <div className="absolute inset-0 z-10 bg-background/98">
+              <TaskGraph
+                actions={dummyActions}
+                objects={dummyObjects}
+                workers={dummyWorkers}
+                selectedActionId={selection?.kind === 'action' ? selection.id : null}
+                onSelectAction={(id) => setSelection(id ? { kind: 'action', id } : null)}
+                onClose={() => setGraphOpen(false)}
+              />
+            </div>
+          )}
+
+          {showMetrics && (
             <MetricsPanel
               metrics={[
-                { value: 3, label: 'Zones', sublabel: 'Restored' },
-                { value: 5, label: 'Responders', sublabel: 'Coordinated' },
-                { value: 4, label: 'Parallel', sublabel: 'Peak' },
-                { value: 1, label: 'Deviation', sublabel: 'Detected' },
-                { value: 1, label: 'Recovery', sublabel: 'Completed' },
-                { value: 0, label: 'Conflicts', sublabel: '' },
+                { value: 3, label: 'Zones restored' },
+                { value: 5, label: 'Responders coordinated' },
+                { value: 4, label: 'Parallel peak' },
+                { value: 1, label: 'Deviation detected' },
+                { value: 1, label: 'Recovery completed' },
+                { value: 0, label: 'Conflicts' },
               ]}
-              totalTime="01:34"
+              totalTime="1:34"
               meanConfidence={0.87}
               idleReduction={0.41}
             />
-          ) : (
-            <>
-              <div className="flex-none bg-bg-1">
-                <GoalBar
-                  goal={{
-                    id: 'goal_1',
-                    raw_text: 'Fulfill expedited order 4471 at the pack station and restock Pick Aisle B.',
-                    normalized_intent: 'fulfill_order',
-                    status: 'executing',
-                    success_predicates: [],
-                    plan_source: 'llm',
-                    planner_notes: '',
-                    created_at: new Date().toISOString(),
-                  }}
-                  stats={{ actions: dummyActions.length, parallel: 2, conflicts: 1 }}
-                />
-              </div>
-              <div className="min-h-0 flex-[3] bg-bg-0">
-                <TaskGraph actions={dummyActions} objects={dummyObjects} workers={dummyWorkers} />
-              </div>
-              <div className="min-h-0 flex-[2] bg-bg-0">
-                <WorldView />
-              </div>
-            </>
           )}
         </div>
 
-        {/* right: event timeline */}
-        <Panel label="Event Timeline" className="min-h-0 overflow-hidden" scroll>
-          <EventTimeline events={dummyEvents} />
-        </Panel>
+        {inspectorOpen && (
+          <button
+            aria-label="Close inspector"
+            onClick={() => setInspectorOpen(false)}
+            className="fixed inset-0 z-20 bg-background/60 xl:hidden"
+          />
+        )}
+        <div
+          className={`fixed inset-y-14 right-0 z-30 w-80 transition-transform duration-200 ease-standard xl:static xl:inset-auto xl:z-auto xl:translate-x-0 ${
+            inspectorOpen ? 'translate-x-0' : 'translate-x-full'
+          }`}
+        >
+          <Inspector
+            selection={selection}
+            goal={goal}
+            actions={dummyActions}
+            workers={dummyWorkers}
+            objects={dummyObjects}
+            zones={dummyZones}
+            onSend={(t) => (t === 'host_inject_failure' ? triggerDeviation() : console.log('send', t))}
+          />
+        </div>
       </div>
 
-      {/* footer: advanced controls + primary actions */}
-      <footer className="flex h-16 items-center gap-3 bg-bg-1 px-4">
-        <div className="flex-1">
-          <AdvancedControls onSend={(t) => console.log('send', t)} />
-        </div>
-        <div className="flex items-center gap-2">
-          {['Compile', 'Start', 'Pause', 'Reset'].map((label) => (
-            <button
-              key={label}
-              className="rounded-sm border border-line-strong px-3 py-1.5 text-[11px] uppercase tracking-[0.1em] text-fg-1 transition-colors duration-200 ease-hive hover:border-info hover:text-info"
-            >
-              {label}
-            </button>
-          ))}
-          <button className="rounded-sm border border-crit px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.1em] text-crit transition-colors duration-200 ease-hive hover:bg-crit hover:text-bg-0">
-            E-Stop
-          </button>
-        </div>
-      </footer>
+      <Timeline events={dummyEvents} />
     </div>
   );
 }

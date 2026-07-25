@@ -1,31 +1,33 @@
 :root {
-  /* surfaces — near-black, never pure black; pure black kills depth on projectors */
-  --bg-0:  #08090B;   /* page */
-  --bg-1:  #0E1013;   /* panel */
-  --bg-2:  #14171C;   /* raised */
-  --line:  #1E232B;   /* hairline */
-  --line-strong: #2B323C;
+  /* surfaces */
+  --background: #0b0b0c;
+  --surface-primary: #141416;
+  --surface-secondary: #1c1c1e;
+  --surface-elevated: #242426;
 
   /* text */
-  --fg-0:  #F5F7FA;   /* primary */
-  --fg-1:  #A2ACBB;   /* secondary */
-  --fg-2:  #626C7A;   /* tertiary / labels */
+  --text-primary: #f5f5f7;
+  --text-secondary: #a1a1a6;
+  --text-tertiary: #6e6e73;
 
-  /* semantic */
-  --ok:    #30D158;
-  --warn:  #FF9F0A;
-  --crit:  #FF375F;
-  --info:  #5AC8FA;
-  --think: #5E5CE6;   /* planning / replanning */
+  /* separators */
+  --separator: rgba(255, 255, 255, 0.08);
+  --separator-strong: rgba(255, 255, 255, 0.14);
 
-  /* worker identity — fixed, matches backend */
+  /* semantic — used sparingly and only for their meaning */
+  --hive-accent: #f2c94c;
+  --hive-accent-ink: #1a1a1a; /* text on filled accent */
+  --success: #30d158;
+  --warning: #ff9f0a;
+  --failure: #ff453a;
+  --information: #0a84ff;
+
+  /* worker identity — a single dot/line only, never a themed surface */
   --w-a: #5AC8FA; --w-b: #5E5CE6; --w-c: #30D158; --w-d: #FF9F0A; --w-e: #FF375F;
-  /* NOTE: there are NO object colors here. Objects are discovered at runtime and carry their own
-     sampled `descriptor.color_hex`. Render that value directly — never map an object to a palette
-     constant. If you find yourself writing OBJECT_COLORS = {...}, stop. */
 
-  --r-sm: 8px; --r-md: 14px; --r-lg: 20px;
-  --ease: cubic-bezier(0.22, 1, 0.36, 1);   /* the only easing you use */
+  --r-control: 8px;
+  --r-surface: 16px;
+  --ease-standard: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -37,15 +39,21 @@
 
 html, body, #root {
   height: 100%;
-  background: var(--bg-0);
-  color: var(--fg-0);
+  background: var(--background);
+  color: var(--text-primary);
 }
 
 body {
-  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text',
+    'Helvetica Neue', Arial, sans-serif;
   font-variant-numeric: tabular-nums;
 }
 
-.font-mono {
-  font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+.font-technical {
+  font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+}
+
+:focus-visible {
+  outline: 2px solid var(--information);
+  outline-offset: 2px;
 }
