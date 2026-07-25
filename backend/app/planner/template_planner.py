@@ -91,6 +91,10 @@ class _Builder:
 
     # ── the objects and destinations this plan operates over ──
 
+    def unbound_phrases(self) -> list[str]:
+        """Phrases the operator typed that HIVE could not tie to anything it can see."""
+        return self.bindings.unresolved_phrases + [a.phrase for a in self.bindings.ambiguous]
+
     def objects(self) -> list[ObservedObject]:
         bound = [self.scene.by_id(i) for i in self.bindings.bound_object_ids]
         objs = [o for o in bound if o is not None]
@@ -98,10 +102,23 @@ class _Builder:
             return objs
         visible = self.scene.visible_objects
         if visible:
-            self.warnings.append(
-                f"No phrase in the objective resolved to a specific object; planned over all "
-                f"{len(visible)} discovered objects."
-            )
+            # Say this out loud. Widening to every object means a *narrower* objective can
+            # produce a *larger* graph, and an audience reads that as HIVE not listening.
+            # Named, it reads as HIVE knowing what it doesn't know.
+            phrases = self.unbound_phrases()
+            if phrases:
+                named = " or ".join(f"“{p}”" for p in phrases[:3])
+                self.warnings.insert(
+                    0,
+                    f"Couldn't bind {named} to anything on the table — planning over all "
+                    f"{len(visible)} discovered items instead.",
+                )
+            else:
+                self.warnings.insert(
+                    0,
+                    f"No phrase in the objective named a specific object — planning over all "
+                    f"{len(visible)} discovered items instead.",
+                )
         return visible
 
     def destinations(self) -> list[str]:
@@ -139,9 +156,13 @@ class _Builder:
 
     # ── shared graph endings ──
 
-    def verify_zones(self, per_zone: dict[str, list[str]]) -> list[str]:
-        """One terminating inspection per destination — the zone's success condition."""
-        ids = []
+    def verify_zones(self, per_zone: dict[str, list[str]]) -> dict[str, str]:
+        """One terminating inspection per destination — the zone's success condition.
+
+        Returns zone_id → inspection action id, so a caller can hang further structure off a
+        specific zone's verification (the gate spine does).
+        """
+        ids: dict[str, str] = {}
         for zone_id, deps in per_zone.items():
             action = self.add(
                 type=ActionType.inspect.value,
@@ -154,7 +175,7 @@ class _Builder:
                 ],
                 lock_targets=[],
             )
-            ids.append(action.id)
+            ids[zone_id] = action.id
         return ids
 
     def finalize(self, deps: list[str]) -> Action:
@@ -173,10 +194,14 @@ class _Builder:
     def apply_gates(self, move_by_object: dict[str, str]) -> None:
         """Dependencies stated in prose: "packing can't start until the scanner is docked".
 
-        A gate constrains the *work* in that area, not the arrival of higher-priority items:
-        an expedited item may reach the pack station before the scanner does. So gates only
-        block actions whose priority is below the gate's. That is what keeps the opening wave
-        wide — and it is also just true of how a floor actually runs.
+        A gate constrains the *work* in that area, not the staging of items into it. "Packing"
+        is the pack station's sign-off, not the act of carrying something over — so the gate is
+        expressed structurally by `stabilize_gate` (arrival → hold → sign-off → release), and
+        only genuinely deferred work (below routine priority — restock, background) is pushed
+        behind the prerequisite here.
+
+        Gating sibling deliveries instead would serialise the opening wave into a queue, which
+        is both worse to look at and wrong about how a floor runs.
         """
         for gate in self.bindings.gates:
             gate_ids = [move_by_object[oid] for oid in gate.gate_object_ids if oid in move_by_object]
@@ -185,11 +210,74 @@ class _Builder:
             for a in self.actions:
                 if a.target_zone != gate.gated_zone_id or a.id in gate_ids:
                     continue
-                if a.priority >= PRIORITY_GATING:
+                if a.priority >= PRIORITY_ROUTINE:
                     continue
                 for gid in gate_ids:
                     if gid != a.id and gid not in a.dependencies:
                         a.dependencies.append(gid)
+
+    def stabilize_gate(self, move_by_object: dict[str, str]) -> tuple[str, str, str] | None:
+        """Wrap the gating item in hold → gated work → release.
+
+        A gate stated in prose ("packing cannot start until the scanner is docked") is a fact
+        about *ordering*, and a graph that only reflects it in priorities is wide and shallow —
+        it reads as fan-out, not as reasoning. Stabilizing the gating item gives the DAG a
+        serial spine: the item arrives, someone holds it steady, the work that depended on it
+        happens, then it is released.
+
+        Returns (gate_zone_id, hold_action_id, gate_object_id), or None when no gate in the
+        objective has both a resolvable item and a target area. At most one spine per plan —
+        two would trade the legibility this is here to buy.
+        """
+        for gate in self.bindings.gates:
+            zone_id = gate.gated_zone_id
+            if not zone_id:
+                continue
+            object_id = next((oid for oid in gate.gate_object_ids if self.scene.by_id(oid)), None)
+            if object_id is None:
+                continue
+            obj = self.scene.by_id(object_id)
+            arrival = move_by_object.get(object_id)
+            hold = self.add(
+                type=ActionType.hold.value,
+                object_id=object_id,
+                target_zone=zone_id,
+                description=(
+                    f"Hold {self.phrase(obj)} steady in {self.zone_label(zone_id)} so it stays put."
+                ),
+                dependencies=[arrival] if arrival else [],
+                priority=PRIORITY_GATING,
+                lock_targets=[f"object:{object_id}"],
+                expected_predicates=[
+                    Predicate(type=PredicateType.object_in_zone.value, subject=object_id, object=zone_id)
+                ],
+            )
+            # Deferred work in that area now waits on the hold rather than the bare arrival:
+            # the prerequisite has to be there *and* steady before it starts. Normal-priority
+            # staging is untouched, so the opening wave stays wide.
+            for a in self.actions:
+                if not arrival or a.id in (hold.id, arrival) or a.target_zone != zone_id:
+                    continue
+                if a.priority >= PRIORITY_ROUTINE:
+                    continue
+                a.dependencies = [d for d in a.dependencies if d != arrival]
+                if hold.id not in a.dependencies:
+                    a.dependencies.append(hold.id)
+            return zone_id, hold.id, object_id
+        return None
+
+    def release_gate(self, object_id: str, deps: list[str]) -> str:
+        obj = self.scene.by_id(object_id)
+        action = self.add(
+            type=ActionType.release.value,
+            object_id=object_id,
+            description=f"Let go of {self.phrase(obj)} and step back from the area.",
+            dependencies=sorted(deps),
+            priority=PRIORITY_ROUTINE,
+            lock_targets=[f"object:{object_id}"],
+            expected_predicates=[Predicate(type=PredicateType.object_visible.value, subject=object_id)],
+        )
+        return action.id
 
     def success_predicates(self) -> list[Predicate]:
         out: list[Predicate] = []
@@ -238,7 +326,20 @@ def deliver_to_zones(b: _Builder) -> None:
         per_zone[zone_id].append(action.id)
         move_by_object[object_id] = action.id
     b.apply_gates(move_by_object)
-    b.finalize(b.verify_zones(per_zone))
+
+    spine = b.stabilize_gate(move_by_object)
+    if spine is None:
+        b.finalize(list(b.verify_zones(per_zone).values()))
+        return
+
+    # The gated area cannot be signed off until the item is held steady there, and the hold
+    # is only released once that sign-off lands. That is the serial spine, and it is the part
+    # of the graph that reads as ordering rather than fan-out.
+    gate_zone, hold_id, gate_object_id = spine
+    per_zone[gate_zone].append(hold_id)
+    inspections = b.verify_zones(per_zone)
+    release_id = b.release_gate(gate_object_id, deps=[inspections[gate_zone]])
+    b.finalize([release_id] + [aid for zid, aid in inspections.items() if zid != gate_zone])
 
 
 def assemble_structure(b: _Builder) -> None:
@@ -270,7 +371,7 @@ def assemble_structure(b: _Builder) -> None:
             dependencies=[hold.id],
             lock_targets=[f"object:{top_id}", f"object:{base_id}"],
             expected_predicates=[
-                Predicate(type=PredicateType.object_stacked_on.value, subject=top_id, object=base_id)
+                Predicate(type=PredicateType.object_visible.value, subject=top_id)
             ],
         )
         release = b.add(
@@ -314,11 +415,11 @@ def assemble_structure(b: _Builder) -> None:
         dependencies=sorted(previous + placed),
         priority=PRIORITY_ROUTINE - 5,
         expected_predicates=[
-            Predicate(type=PredicateType.object_stacked_on.value, subject=top_id, object=base_id)
+            Predicate(type=PredicateType.object_visible.value, subject=top_id)
         ],
         lock_targets=[],
     )
-    b.finalize([inspect.id] + b.verify_zones(per_zone))
+    b.finalize([inspect.id] + list(b.verify_zones(per_zone).values()))
 
 
 def sort_by_attribute(b: _Builder) -> None:
@@ -347,7 +448,7 @@ def sort_by_attribute(b: _Builder) -> None:
             ],
         )
         per_zone[zone_id].append(action.id)
-    b.finalize(b.verify_zones(per_zone))
+    b.finalize(list(b.verify_zones(per_zone).values()))
 
 
 def relay_chain(b: _Builder) -> None:
@@ -372,7 +473,7 @@ def relay_chain(b: _Builder) -> None:
             priority=b.priority(obj.id),
             dependencies=list(previous),
             lock_targets=[f"object:{obj.id}"],
-            expected_predicates=[Predicate(type=PredicateType.worker_acknowledged.value, subject=obj.id)],
+            expected_predicates=[Predicate(type=PredicateType.object_visible.value, subject=obj.id)],
         )
         previous = [action.id]
     dests = b.destinations()
@@ -389,7 +490,7 @@ def relay_chain(b: _Builder) -> None:
             Predicate(type=PredicateType.object_in_zone.value, subject=obj.id, object=zone_id)
         ],
     )
-    b.finalize(b.verify_zones({zone_id: [final_move.id]}))
+    b.finalize(list(b.verify_zones({zone_id: [final_move.id]}).values()))
 
 
 def sequence_arrange(b: _Builder) -> None:
@@ -419,7 +520,7 @@ def sequence_arrange(b: _Builder) -> None:
         )
         previous = [action.id]
         ids.append(action.id)
-    b.finalize(b.verify_zones({zone_id: ids}))
+    b.finalize(list(b.verify_zones({zone_id: ids}).values()))
 
 
 def gather(b: _Builder) -> None:
@@ -444,7 +545,7 @@ def gather(b: _Builder) -> None:
             ],
         )
         ids.append(action.id)
-    b.finalize(b.verify_zones({zone_id: ids}))
+    b.finalize(list(b.verify_zones({zone_id: ids}).values()))
 
 
 def survey(b: _Builder) -> None:

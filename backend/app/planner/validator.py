@@ -84,22 +84,38 @@ def notes_for(actions: list[Action]) -> str:
 
 
 def _synth_predicates(action: Action) -> list[Predicate]:
-    """Check 4 — a plan without expected predicates cannot be verified, so derive them."""
+    """Check 4 — a plan without expected predicates cannot be verified, so derive them.
+
+    Every predicate emitted here must be one `verifier.check_predicate` can actually satisfy
+    from the world state. That constraint is load-bearing: `verifier.evaluate` refuses to
+    verify an action while *any* of its predicates is unsatisfied, so a predicate nothing can
+    ever report does not degrade the action — it strands it, and the run stops there.
+
+    Two encodings are deliberately avoided:
+      * `object_held_by` — the holder is unknown at plan time (the scheduler assigns later),
+        and nothing in the pipeline reports `held_by` for a human's hands.
+      * `object_stacked_on` — nothing sets `stacked_on` today, so a stack asserts the
+        weaker-but-observable fact that the top item reached the base's area.
+    """
     t, oid = action.type, action.object_id
     if t in (ActionType.place_in_zone.value, ActionType.move_to_zone.value) and oid and action.target_zone:
         return [Predicate(type=PredicateType.object_in_zone.value, subject=oid, object=action.target_zone)]
-    if t == ActionType.place_on.value and oid and action.target_object_id:
-        return [Predicate(type=PredicateType.object_stacked_on.value, subject=oid, object=action.target_object_id)]
-    if t in (ActionType.pick_up.value, ActionType.hold.value) and oid:
-        return [Predicate(type=PredicateType.object_held_by.value, subject=oid, object=action.assigned_worker_id or "")]
-    if t == ActionType.release.value and oid:
+    if t in (ActionType.place_on.value, ActionType.hold.value) and oid:
+        if action.target_zone:
+            return [Predicate(type=PredicateType.object_in_zone.value, subject=oid, object=action.target_zone)]
+        return [Predicate(type=PredicateType.object_visible.value, subject=oid)]
+    if t in (ActionType.pick_up.value, ActionType.release.value) and oid:
         return [Predicate(type=PredicateType.object_visible.value, subject=oid)]
     if t == ActionType.inspect.value:
         if action.target_zone:
             return [Predicate(type=PredicateType.all_objects_in_zone.value, subject=action.target_zone,
                               object=action.target_zone)]
-        return [Predicate(type=PredicateType.sequence_completed.value, subject=action.id)]
-    return [Predicate(type=PredicateType.worker_acknowledged.value, subject=action.id)]
+        # subject="objective" is the sentinel for "every other action"; naming this action's
+        # own id here would make the predicate wait on itself forever.
+        return [Predicate(type=PredicateType.sequence_completed.value, subject="objective")]
+    if oid:
+        return [Predicate(type=PredicateType.object_visible.value, subject=oid)]
+    return [Predicate(type=PredicateType.sequence_completed.value, subject="objective")]
 
 
 def _derive_locks(action: Action) -> list[str]:

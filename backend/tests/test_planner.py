@@ -15,6 +15,7 @@ from app.planner import base as planner_base
 from app.planner import llm_planner
 from app.planner.base import NotReady, compile_goal, replan_from_state
 from app.planner.grounding import resolve_all
+from app.planner.validator import topo_layers
 from app.planner.template_planner import route
 from planner_fixtures import (
     FLAGSHIP_GOAL,
@@ -60,10 +61,58 @@ async def test_parallelism():
 
 async def test_priorities_come_from_the_words_not_the_objects():
     plan = await compile_goal(FLAGSHIP_GOAL, flagship_scene(), make_workers(), use_llm=False)
-    by_object = {a.object_id: a for a in plan.actions if a.object_id}
+    by_object = {
+        a.object_id: a
+        for a in plan.actions
+        if a.object_id and a.type == ActionType.place_in_zone.value
+    }
     assert by_object["obj_1"].priority == 100  # "expedited"
     assert by_object["obj_5"].priority == 50  # "restock"
     assert by_object["obj_4"].priority == 85  # blocking prerequisite
+
+
+async def test_flagship_has_a_serial_spine():
+    """Wide *and* deep. Pure fan-out reads as a list; a spine reads as reasoning about order."""
+    plan = await compile_goal(FLAGSHIP_GOAL, flagship_scene(), make_workers(), use_llm=False)
+    stats = plan.stats
+    assert 9 <= stats["action_count"] <= 11, stats
+    assert stats["parallel_peak"] >= 4, stats
+    assert stats["layer_count"] >= 4, stats
+
+    hold = next(a for a in plan.actions if a.type == ActionType.hold.value)
+    release = next(a for a in plan.actions if a.type == ActionType.release.value)
+    assert hold.object_id == release.object_id  # the same item, held then let go
+    assert hold.target_zone and hold.priority == 85
+
+    stage_of = {aid: i for i, layer in enumerate(plan.layers()) for aid in layer}
+    arrival = next(
+        a for a in plan.actions
+        if a.object_id == hold.object_id and a.type == ActionType.place_in_zone.value
+    )
+    sign_off = next(
+        a for a in plan.actions
+        if a.type == ActionType.inspect.value and a.target_zone == hold.target_zone
+    )
+    assert stage_of[arrival.id] < stage_of[hold.id] < stage_of[sign_off.id] < stage_of[release.id]
+
+
+async def test_survey_fallback_says_it_could_not_bind():
+    """A silent widening looks like HIVE ignoring you. Named, it looks like HIVE being honest."""
+    scene = make_scene([make_object("obj_1", "red", 0.35, 0.45), make_object("obj_2", "blue", 0.5, 0.5)])
+    plan = await compile_goal("Move the widget to the Pack Station", scene, make_workers(), use_llm=False)
+    assert plan.warnings, "widening to every object must never be silent"
+    first = plan.warnings[0]
+    assert "widget" in first and "2 discovered items" in first
+    # and the plan is still real: it moves things, over real observed ids
+    assert [a.object_id for a in plan.actions if a.object_id]
+
+
+async def test_ambiguous_phrase_is_named_when_the_host_never_answers():
+    scene = make_scene([make_object("obj_1", "red", 0.3, 0.4), make_object("obj_2", "red", 0.7, 0.4)])
+    result = resolve_all("Move the red item to the Pack Station", scene)
+    assert result.ambiguous  # normally the host clicks; if a plan is forced anyway, say why
+    plan = await compile_goal("Deliver something to the Pack Station", scene, make_workers(), use_llm=False)
+    assert plan.warnings and "planning over all" in plan.warnings[0]
 
 
 async def test_narrower_goal_smaller_graph():
@@ -92,9 +141,21 @@ async def test_gating_language_becomes_a_dependency():
         make_workers(),
         use_llm=False,
     )
-    green = next(a for a in plan.actions if a.object_id == "obj_1")
-    scanner = next(a for a in plan.actions if a.object_id == "obj_2")
-    assert scanner.id in green.dependencies
+    arrival = next(
+        a for a in plan.actions if a.object_id == "obj_2" and a.type == ActionType.place_in_zone.value
+    )
+    hold = next(a for a in plan.actions if a.type == ActionType.hold.value)
+    sign_off = next(a for a in plan.actions if a.type == ActionType.inspect.value and a.target_zone == "zone_2")
+    release = next(a for a in plan.actions if a.type == ActionType.release.value)
+
+    # The prose gate becomes a serial spine: the prerequisite arrives, someone holds it steady,
+    # the area is signed off, then it is released. Staging is never blocked by it.
+    assert hold.object_id == "obj_2" and hold.dependencies == [arrival.id]
+    assert hold.id in sign_off.dependencies
+    assert release.object_id == "obj_2" and release.dependencies == [sign_off.id]
+    layers = topo_layers(plan.actions)
+    stage_of = {aid: i for i, layer in enumerate(layers) for aid in layer}
+    assert stage_of[arrival.id] < stage_of[hold.id] < stage_of[sign_off.id] < stage_of[release.id]
 
 
 async def test_stacking_stabilizes_the_base():

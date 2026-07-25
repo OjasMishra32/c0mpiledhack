@@ -734,17 +734,17 @@ def _extract_place_phrases(goal_text: str, scene: Scene) -> tuple[list[ZoneBindi
 def _extract_object_phrases(goal_text: str, scene: Scene, place_spans: list[tuple[int, int]],
                             hints: list[str]) -> list[tuple[str, tuple[int, int]]]:
     out: list[tuple[str, tuple[int, int]]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, tuple[int, int]]] = set()
 
     def add(phrase: str, span: tuple[int, int]) -> None:
         phrase = phrase.strip()
-        if not phrase or phrase.lower() in seen:
+        if not phrase or (phrase.lower(), span) in seen:
             return
         if any(span[0] < s[1] and s[0] < span[1] for s in place_spans):
             return  # this is a place, and places are resolved separately
         if any(span[0] < s[1] and s[0] < span[1] for _, s in out):
             return  # already covered by a longer phrase over the same words
-        seen.add(phrase.lower())
+        seen.add((phrase.lower(), span))
         out.append((phrase, span))
 
     for hint in hints:  # scenario grounding hints: phrases likely to appear, nothing more
