@@ -8,9 +8,9 @@ interface InspectorRowProps {
 
 export function InspectorRow({ label, value, className = '' }: InspectorRowProps) {
   return (
-    <div className={`flex items-start justify-between gap-4 py-2 ${className}`}>
-      <span className="text-[13px] text-text-tertiary">{label}</span>
-      <span className="text-right text-[13px] text-text-primary">{value}</span>
+    <div className={`flex items-baseline justify-between gap-4 py-1.5 ${className}`}>
+      <span className="shrink-0 text-[13px] leading-relaxed text-text-tertiary">{label}</span>
+      <span className="text-right text-[13px] leading-relaxed text-text-primary">{value}</span>
     </div>
   );
 }

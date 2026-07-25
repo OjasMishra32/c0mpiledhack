@@ -12,8 +12,10 @@ export function Panel({ label, right, children, className = '', scroll = false }
   return (
     <div className={`flex h-full flex-col bg-surface-primary ${className}`}>
       {label && (
-        <div className="flex items-center justify-between px-4 pb-2 pt-3.5">
-          <span className="text-[15px] font-semibold text-text-primary">{label}</span>
+        <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-b border-separator px-4">
+          <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-text-tertiary">
+            {label}
+          </span>
           {right}
         </div>
       )}
