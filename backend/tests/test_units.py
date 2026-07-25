@@ -374,7 +374,7 @@ async def test_adjudication_suppresses_a_refuted_deviation(state):
     before = state.metrics.deviations
     orchestrator.recovery_engine.detect = lambda _s: [trigger]  # type: ignore[assignment]
     try:
-        orchestrator.handle_deviations()
+        await orchestrator.handle_deviations()
     finally:
         import importlib
         importlib.reload(orchestrator.recovery_engine)

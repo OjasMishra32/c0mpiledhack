@@ -9,14 +9,25 @@ keeps running. That is the whole pitch, and it is why we never call state.reset(
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import settings
 from .models import Action, Predicate, now_iso
+
+log = logging.getLogger("hive.recovery")
 
 DEBOUNCE_TICKS = 2
 DISCONNECT_GRACE = 8.0
+
+# Below this a deterministic strategy is admitting it is only an approximation, and the model
+# is asked to recompile the remaining objective instead. At or above it nothing is escalated —
+# the model improves the answer, it never gates it.
+ESCALATION_CONFIDENCE = 0.5
+
+IN_FLIGHT = ("dispatched", "acknowledged", "executing", "awaiting_verification")
 
 
 @dataclass
@@ -39,8 +50,13 @@ class RecoveryPlan:
     free_workers: list[str] = field(default_factory=list)
     insert_actions: list[Action] = field(default_factory=list)
     reassign: dict[str, str | None] = field(default_factory=dict)
+    # Actions a recompiled plan replaces. Unlike `cancel_action_ids` this may include work
+    # that was verified and no longer holds — a delivery the world has since undone is not a
+    # result any more, and leaving it verified would re-trigger the same deviation forever.
+    supersede_action_ids: list[str] = field(default_factory=list)
     narration: str = ""
     confidence: float = 1.0
+    source: str = "deterministic"  # deterministic | llm — which strategy produced this plan
 
 
 # ── detection ───────────────────────────────────────────────────────────────
@@ -331,8 +347,283 @@ def _retrieve_and_restore(trigger: DeviationTrigger, state: Any, plan: RecoveryP
                 plan.reassign.setdefault(aid, None)
 
     n = len(pausable)
-    plan.narration = (
-        f"{trigger.message} {n} dependent action{'s' if n != 1 else ''} paused. "
-        f"Dispatching retrieval; unrelated work continues."
+    tail = (
+        "Dispatching retrieval; unrelated work continues."
+        if plan.insert_actions
+        else "Nothing to retrieve towards — holding the chain."
     )
+    plan.narration = (
+        f"{trigger.message} {n} dependent action{'s' if n != 1 else ''} paused. {tail}"
+    )
+
+    # How much this strategy believes its own answer. A surgical retrieval is exactly right
+    # for ONE displaced object. When several have moved at once it repairs one of them, leaves
+    # a duplicate action per object behind, and says nothing about the order the rest of the
+    # objective should now run in — which is the case worth handing to the model.
+    displaced = set(displaced_objects(state)) | ({oid} if oid else set())
+    if not plan.insert_actions:
+        plan.confidence = 0.35  # no object, or nowhere to put it back
+    elif len(displaced) > 1:
+        plan.confidence = 0.45
     return plan
+
+
+def displaced_objects(state: Any) -> list[str]:
+    """Objects that are not where the plan has already established they belong.
+
+    Counts a delivery HIVE verified and then lost, and an object that has landed somewhere
+    that is neither its origin nor its target while its action is in flight. An item that
+    simply has not moved yet is PENDING WORK, not displacement — same rule as `detect`.
+    """
+    out: list[str] = []
+    for a in state.actions.values():
+        oid = a.object_id
+        if not oid or not a.target_zone or oid in out:
+            continue
+        obj = state.scene.by_id(oid)
+        if obj is None or obj.held_by:
+            continue
+        if a.status == "verified":
+            if obj.zone != a.target_zone:
+                out.append(oid)
+        elif a.status in IN_FLIGHT and obj.zone not in (a.target_zone, "field", a.origin_zone):
+            out.append(oid)
+    return sorted(out)
+
+
+# ── escalation ──────────────────────────────────────────────────────────────
+
+
+async def plan_recovery_async(trigger: DeviationTrigger, state: Any) -> RecoveryPlan:
+    """`plan_recovery`, with the model as an escalation above it — never as a gate.
+
+    The deterministic strategies are the floor and they always ship. Only when one of them
+    reports `confidence < ESCALATION_CONFIDENCE` (several objects displaced at once, or
+    nothing to aim a retrieval at) does the model get asked to recompile the *remaining*
+    objective from where the world actually is. Timeout, exception, prose, an empty plan, a
+    plan that drops work — any of them and the deterministic plan stands.
+
+    This runs inside the orchestrator tick, so it must never raise. It doesn't.
+    """
+    plan = plan_recovery(trigger, state)
+    if plan.confidence >= ESCALATION_CONFIDENCE:
+        return plan
+    if not settings.nvidia_api_key:
+        return plan  # a keyless run IS the floor, by design, and stays quiet about it
+    try:
+        return await _escalate(plan, state)
+    except Exception as exc:
+        # Containment. A failed escalation is a log line and one warn event on the timeline;
+        # the deterministic plan is already correct, just blunter.
+        log.warning("recovery escalation failed: %s", exc)
+        _emit(
+            state,
+            "replan_declined",
+            f"Replanning unavailable ({type(exc).__name__}). Deterministic recovery stands.",
+            kind=trigger.kind,
+        )
+        return plan
+
+
+async def _escalate(plan: RecoveryPlan, state: Any) -> RecoveryPlan:
+    """Ask the planner to recompile from current state; adopt it only if it is strictly usable."""
+    trigger = plan.trigger
+    owed = _owed_objects(state)
+    if not owed:
+        return plan  # the objective asks for nothing the world is missing — nothing to recompile
+
+    _emit(
+        state,
+        "replanning",
+        f"Recovery confidence {int(plan.confidence * 100)}% — recompiling the remaining "
+        f"objective from the world as it is now.",
+        kind=trigger.kind,
+        confidence=plan.confidence,
+        objects=sorted(owed),
+    )
+
+    from .planner.base import replan_from_state  # local: keeps the planner off the import path
+
+    # `replan_from_state` owns its own 8s window and its own deterministic fallback, so there
+    # is nothing to wrap here — only something to judge on the way out.
+    try:
+        result = await replan_from_state(_replan_view(state), _deviation_payload(trigger, state))
+    except Exception as exc:
+        log.warning("replan_from_state failed: %s", exc)
+        _emit(
+            state,
+            "replan_declined",
+            f"Replanning failed ({type(exc).__name__}). Deterministic recovery stands.",
+            kind=trigger.kind,
+        )
+        return plan
+
+    reason = _unusable(result, owed)
+    if reason:
+        _emit(
+            state,
+            "replan_declined",
+            f"Replan declined: {reason}. Deterministic recovery stands.",
+            kind=trigger.kind,
+        )
+        return plan
+    return _adopt(result, plan, state)
+
+
+def _unusable(result: Any, owed: set[str]) -> str | None:
+    """Why this replan may not be trusted, or None if it may. Conservative on purpose."""
+    if result is None or not getattr(result, "actions", None):
+        return "the model returned no actions"
+    if getattr(result, "source", "") != "llm":
+        # base already fell through to its own deterministic compile — a whole fresh graph,
+        # which is a worse answer than the surgical recovery we are already holding.
+        return f"the model did not answer (fell back to {result.source})"
+    covered = {a.object_id for a in result.actions if a.object_id}
+    missing = sorted(owed - covered)
+    if missing:
+        return f"it dropped {', '.join(missing)}"
+    return None
+
+
+def _adopt(result: Any, plan: RecoveryPlan, state: Any) -> RecoveryPlan:
+    """Turn a recompiled plan into a RecoveryPlan the orchestrator applies as one atomic step.
+
+    The recompiled graph owns the remaining objective, so everything it replaces has to stop
+    competing for the same objects: pending actions AND verified deliveries the world has
+    since undone. Two live sets over one object is a deadlock — both hold `object:<id>`, so
+    neither ever runs.
+    """
+    trigger = plan.trigger
+    superseded: list[str] = []
+    for a in state.actions.values():
+        if not a.terminal or _regressed(a, state):
+            superseded.append(a.id)
+
+    used = set(state.actions)
+    rename: dict[str, str] = {}
+    fresh: list[Action] = []
+    for a in result.actions:
+        rid = _next_recovery_id(used)
+        used.add(rid)
+        rename[a.id] = rid
+        a.id = rid
+        a.is_recovery = True
+        a.status = "queued"  # the orchestrator opens the ones whose dependencies allow it
+        a.assigned_worker_id = None
+        a.assignment_reason = ""
+        a.instruction = None
+        a.evidence = []
+        a.retry_count = 0
+        a.attempt = 0
+        a.created_at = now_iso()
+        if not a.lock_targets and a.object_id:
+            a.lock_targets = [f"object:{a.object_id}"]
+        if trigger.object_id and a.object_id == trigger.object_id:
+            a.priority = max(a.priority, 105)  # the repair goes first
+        fresh.append(a)
+    for a in fresh:
+        a.dependencies = [rename[d] for d in a.dependencies if d in rename]
+
+    n_new, n_old = len(fresh), len(superseded)
+    escalated = RecoveryPlan(
+        trigger=trigger,
+        supersede_action_ids=sorted(superseded),
+        insert_actions=fresh,
+        confidence=0.8,
+        source=result.source,
+        narration=(
+            f"{trigger.message} Remaining objective recompiled from the current world state: "
+            f"{n_new} action{'s' if n_new != 1 else ''} replacing {n_old}. "
+            f"Verified deliveries that still hold are kept."
+        ),
+    )
+    _emit(
+        state,
+        "plan_replanned",
+        f"Objective recompiled from where the world actually is: {n_new} "
+        f"action{'s' if n_new != 1 else ''} replacing {n_old}.",
+        kind=trigger.kind,
+        source=result.source,
+        actions=n_new,
+        superseded=n_old,
+        notes=getattr(result, "notes", ""),
+    )
+    return escalated
+
+
+def _regressed(a: Action, state: Any) -> bool:
+    """A verified delivery the world no longer agrees with."""
+    if a.status != "verified" or not a.object_id or not a.target_zone:
+        return False
+    obj = state.scene.by_id(a.object_id)
+    return obj is not None and obj.zone != a.target_zone
+
+
+def _next_recovery_id(used: set[str]) -> str:
+    n = 1
+    while f"r{n}" in used:
+        n += 1
+    return f"r{n}"
+
+
+def _owed_objects(state: Any) -> set[str]:
+    """Objects the objective still requires somewhere they are not — what a replan must cover."""
+    from .planner.base import unsatisfied_deliveries
+
+    goal = getattr(state, "goal", None)
+    predicates = list(getattr(goal, "success_predicates", None) or [])
+    return {oid for oid, _ in unsatisfied_deliveries(state.scene, predicates)}
+
+
+def _replan_view(state: Any) -> Any:
+    """List-shaped snapshot of the live state, which is what the planner reads.
+
+    HiveState keys actions and workers by id; `replan_from_state` iterates them and wants
+    `.goal` as well. Same one-adapter-beats-changing-either-side call as
+    `orchestrator._SchedulerView`. The scene and goal are passed through by reference.
+    """
+    from .models import PlannerState
+
+    workers, actions = state.workers, state.actions
+    return PlannerState(
+        scenario_id=getattr(getattr(state, "scenario", None), "id", None),
+        goal=state.goal,
+        workers=list(workers.values()) if isinstance(workers, dict) else list(workers),
+        actions=list(actions.values()) if isinstance(actions, dict) else list(actions),
+        scene=state.scene,
+        locks=dict(getattr(state, "locks", None) or {}),
+    )
+
+
+def _deviation_payload(trigger: DeviationTrigger, state: Any) -> dict:
+    return {
+        "kind": trigger.kind,
+        "message": trigger.message,
+        "object_id": trigger.object_id,
+        "worker_id": trigger.worker_id,
+        "expected": trigger.expected,
+        "observed": trigger.observed,
+        "action_ids": list(trigger.action_ids),
+        "verified_summary": _verified_summary(state),
+    }
+
+
+def _verified_summary(state: Any) -> str:
+    """What is already true and must not be re-done. Only deliveries that STILL hold count."""
+    parts = [
+        f"{state.label_of(a.object_id)} in {state.zone_label(a.target_zone)}"
+        for a in state.actions.values()
+        if a.status == "verified" and a.object_id and a.target_zone and not _regressed(a, state)
+    ]
+    return ", ".join(parts) or "nothing yet"
+
+
+def _emit(state: Any, type: str, message: str, *, severity: str = "warn", **meta: Any) -> None:
+    """The tick's own emitter, guarded. Telemetry must never be the thing that breaks recovery."""
+    emit = getattr(state, "emit_soon", None)
+    if emit is None:
+        return
+    try:
+        emit(type, message, severity=severity, **meta)
+    except Exception as exc:  # pragma: no cover — an emitter that raises is already broken
+        log.warning("emit(%s) failed: %s", type, exc)

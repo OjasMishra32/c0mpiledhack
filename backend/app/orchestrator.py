@@ -4,7 +4,8 @@ Only this module mutates Action.status, Worker.status, and locks. Everything els
 an inbox message and waits its turn. That single rule removes the entire class of
 "two things changed the same action in the same tick" bugs.
 
-Steps 2-11 of tick() are synchronous, so tests can call tick() directly.
+Steps 2-11 of tick() are synchronous — except deviation handling, which may await a model
+replan — so tests can drive the loop by awaiting tick() directly.
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ async def tick() -> None:
         # reopen the objective rather than be silently ignored.
         if world_model.refresh(state):
             ws.mark_world_dirty()
-        handle_deviations()
+        await handle_deviations()
         if state.actions_with_status("queued", "available", "assigned", *DISPATCHABLE):
             state.execution_status = "executing"
             if state.goal:
@@ -85,7 +86,7 @@ async def tick() -> None:
     evaluate_verifications()
     complete_actions()
     unlock_dependents()
-    handle_deviations()
+    await handle_deviations()
     schedule_actions()
     dispatch()
     check_goal()
@@ -210,7 +211,7 @@ def _trigger_key(trigger: Any) -> str:
     return f"{trigger.kind}:{trigger.object_id or trigger.worker_id or ''}:{','.join(trigger.action_ids)}"
 
 
-def handle_deviations() -> None:
+async def handle_deviations() -> None:
     triggers = recovery_engine.detect(state)
     if not triggers:
         return
@@ -242,8 +243,15 @@ def handle_deviations() -> None:
             _start_adjudication(key, trigger)
             continue  # hold this trigger for one round
 
-        plan = recovery_engine.plan_recovery(trigger, state)
+        # The adjudicated trigger goes to the deterministic strategies, and a low-confidence
+        # one may escalate to the planner first. That call owns its own timeout and can never
+        # raise back into the tick.
+        plan = await recovery_engine.plan_recovery_async(trigger, state)
         _apply_recovery(plan)
+        if plan.supersede_action_ids:
+            # The graph was recompiled. The rest of this batch describes a plan that no
+            # longer exists, so re-detect next tick rather than patch a stale one.
+            break
 
 
 def _should_adjudicate(key: str) -> bool:
@@ -318,6 +326,18 @@ def _apply_recovery(plan: recovery_engine.RecoveryPlan) -> None:
             state.free_locks_for(aid)
             _release_worker(a)
 
+    # A recompiled plan owns the remaining objective, so whatever it replaces must stop
+    # competing for the same objects — including a delivery that was verified and that the
+    # world has since undone. Two live actions over one object is a deadlock, not redundancy.
+    for aid in plan.supersede_action_ids:
+        a = state.actions.get(aid)
+        if not a or a.status == "cancelled":
+            continue
+        _cancel_instruction(a, "superseded by the recompiled plan")
+        a.status = "cancelled"
+        state.free_locks_for(aid)
+        _release_worker(a)
+
     # Pause ONLY the dependency chain that depends on the affected resource.
     # Everything else keeps running — this is the whole pitch.
     for aid in plan.pause_action_ids:
@@ -363,7 +383,9 @@ def _apply_recovery(plan: recovery_engine.RecoveryPlan) -> None:
     for new in plan.insert_actions:
         if new.id not in state.actions:
             state.actions[new.id] = new
-            new.status = "available"
+            # A single retrieval opens immediately; a recompiled chain keeps its ordering and
+            # is opened by unlock_dependents as each dependency verifies.
+            new.status = "available" if not new.dependencies else "queued"
             state.metrics.actions_total = len(state.actions)
             state.emit_soon(
                 "recovery_action_created",
