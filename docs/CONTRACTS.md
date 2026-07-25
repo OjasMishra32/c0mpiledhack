@@ -257,7 +257,7 @@ button stays disabled until `stable` is true, which takes ~1.5s after a scan.
   "target_object_id": null,
   "target_zone": "z2",
   "assigned_worker_id": "worker_c",
-  "assignment_reason": "CHARLIE selected: closest to the scanner, currently idle, no conflicting activity in that zone.",
+  "assignment_reason": "CHARLIE selected: closest to the handheld scanner, currently idle, no conflicting activity in Pack Station. ECHO was further from the handheld scanner.",
   "dependencies": [],
   "status": "dispatched",
   "priority": 85,                   // higher runs first when both are available
@@ -272,9 +272,19 @@ button stays disabled until `stable` is true, which takes ~1.5s after a scan.
   "created_at": "…",
   "dispatched_at": "…",
   "completed_at": null,
-  "lock_targets": ["object:yellow", "zone:z2"]
+  "lock_targets": ["object:yellow"]     // objects only — see §8.1
 }
 ```
+
+`assignment_reason` is generated from the scheduler's explicit scoring factors — never model
+prose — and has a fixed shape: `<CALLSIGN> selected:`, then at most three factors that favoured
+them, then **one counterfactual sentence naming another worker**. The counterfactual is always
+present, because an explanation that says what but never why-not is half an explanation: the next
+viable candidate when there is one, otherwise the strongest *blocked* candidate carrying its own
+exclusion reason (*"DELTA cannot reach Pack Station."*), and *"No other responder was available."*
+only when the roster holds a single worker. Zones appear as their **label**, never as a zone id or
+a generic "that zone". Attribution (§9) may re-rank the winner and rewrite this string; the shape
+does not change.
 
 `lock_targets` are opaque strings. The orchestrator holds a `dict[str, action_id]` of live locks.
 Two actions whose `lock_targets` intersect **may never be dispatched in the same tick**. This is
