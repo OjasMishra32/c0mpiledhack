@@ -111,7 +111,7 @@ async def _publish_plan(text: str, result: Any, *, upgraded: bool) -> None:
     for a in state.actions.values():
         if a.status not in ("available", "queued"):
             a.status = "available" if not a.dependencies else "queued"
-        a.timeout_seconds = a.timeout_seconds or settings.action_timeout
+        a.timeout_seconds = settings.action_timeout
 
     if state.goal is None or not upgraded:
         state.goal = Goal(

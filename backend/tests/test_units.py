@@ -382,3 +382,16 @@ async def test_adjudication_suppresses_a_refuted_deviation(state):
     assert state.metrics.deviations == before, "a refuted deviation must not fire"
     assert any(e.type == "deviation_dismissed" for e in state.events)
     orchestrator.reset_adjudication()
+
+
+async def test_demo_mode_shortens_action_timeouts(state):
+    """Demo mode exists to keep the run inside 90 seconds. If timeouts stay at the
+    production default, a stalled action holds the demo for 25s of dead air."""
+    from app.config import settings
+
+    await H["host_compile_goal"]({"text": state.scenario.build_goal(state.scene)})
+    assert state.actions
+    for a in state.actions.values():
+        assert a.timeout_seconds == settings.action_timeout
+    if settings.demo_mode:
+        assert settings.action_timeout < settings.default_timeout_seconds
