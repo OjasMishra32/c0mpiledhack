@@ -252,15 +252,13 @@ hive/
 
 ## Team
 
-| Person | Owns |
-| --- | --- |
-| **Ojas** | VLM perception layer (NIM), backend core, orchestration loop, integration, demo direction |
-| **Zechariah** | Planner (LLM + template + validator), capability-aware scheduler |
-| **David** | Host command center — design system, task DAG, timeline, AR overlay UI |
-| **Steven** | Vision pipeline, world model, calibration, simulation mode |
-| **Nikki** | Worker PWA, verification + recovery engines, Voygr voice escalation |
+| Person | Owns | Handoff |
+| --- | --- | --- |
+| **Ojas** | Intelligence, orchestration loop, perception, demo direction | `OJAS.md` |
+| **Steven** | Interface — host command center, deviation choreography, phone client | `STEVEN.md` |
+| **Zechariah** | Planning, grounding, validation, capability-aware scheduling | `ZECHARIAH.md` |
 
-Start with `docs/CONTRACTS.md`, then your own `.md`.
+Start with `docs/CONTRACTS.md`, then your own handoff. **`git pull --rebase origin main` before every session.**
 
 ---
 
