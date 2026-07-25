@@ -22,6 +22,32 @@
   --failure: #ff453a;
   --information: #0a84ff;
 
+  /* ── channel triplets ────────────────────────────────────────────────
+     Same colours, expressed as space-separated sRGB channels so they can
+     carry an alpha: rgb(var(--background-rgb) / 0.95).
+
+     Tailwind cannot apply an opacity modifier to a colour declared as a
+     bare `var(--x)` string — `bg-background/95` and friends compile to
+     nothing at all, so translucent overlays silently lose their
+     background. Use `bg-[rgb(var(--background-rgb)/0.95)]` until
+     tailwind.config.ts switches its colour values to the
+     `rgb(var(--…-rgb) / <alpha-value>)` form, at which point the plain
+     `/95` modifiers start working and both spellings resolve here. */
+  --background-rgb: 11 11 12;
+  --surface-primary-rgb: 20 20 22;
+  --surface-secondary-rgb: 28 28 30;
+  --surface-elevated-rgb: 36 36 38;
+
+  --text-primary-rgb: 245 245 247;
+  --text-secondary-rgb: 161 161 166;
+  --text-tertiary-rgb: 110 110 115;
+
+  --hive-accent-rgb: 242 201 76;
+  --success-rgb: 48 209 88;
+  --warning-rgb: 255 159 10;
+  --failure-rgb: 255 69 58;
+  --information-rgb: 10 132 255;
+
   /* worker identity — a single dot/line only, never a themed surface */
   --w-a: #5AC8FA; --w-b: #5E5CE6; --w-c: #30D158; --w-d: #FF9F0A; --w-e: #FF375F;
 
@@ -53,7 +79,11 @@ body {
   font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
 }
 
-:focus-visible {
+/* Keyboard focus is not optional. The selector is doubled on purpose: a
+   Tailwind `outline-none` utility has the same specificity and lands later in
+   the cascade, so a single `:focus-visible` here would lose to it. */
+:focus-visible,
+:focus-visible:focus-visible {
   outline: 2px solid var(--information);
   outline-offset: 2px;
 }

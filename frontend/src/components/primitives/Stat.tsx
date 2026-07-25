@@ -1,17 +1,31 @@
 interface StatProps {
   value: string | number;
   label: string;
+  /** `hero` is the end-of-run screenshot scale; `panel` sits inside a sidebar. */
   size?: 'hero' | 'panel';
+  align?: 'start' | 'center';
   className?: string;
 }
 
-export function Stat({ value, label, size = 'panel', className = '' }: StatProps) {
-  const valueClass = size === 'hero' ? 'text-[32px] font-semibold' : 'text-[26px] font-semibold';
+/**
+ * A number and what it means. The number is set light and tabular so a row of them
+ * stays optically level and does not jitter while it counts up; the label is the
+ * standard 11px uppercase marker.
+ */
+export function Stat({ value, label, size = 'panel', align = 'start', className = '' }: StatProps) {
+  const valueClass =
+    size === 'hero'
+      ? 'text-[64px] font-light leading-[0.95] tracking-[-0.03em]'
+      : 'text-[30px] font-light leading-none tracking-[-0.02em]';
 
   return (
-    <div className={`flex flex-col items-start gap-0.5 ${className}`}>
+    <div
+      className={`flex min-w-0 flex-col gap-2 ${align === 'center' ? 'items-center text-center' : 'items-start'} ${className}`}
+    >
       <span className={`tabular-nums text-text-primary ${valueClass}`}>{value}</span>
-      <span className="text-[12px] text-text-tertiary">{label}</span>
+      <span className="text-[11px] font-semibold uppercase leading-none tracking-[0.14em] text-text-tertiary">
+        {label}
+      </span>
     </div>
   );
 }
