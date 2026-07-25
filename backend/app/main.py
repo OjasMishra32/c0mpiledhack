@@ -1,353 +1,218 @@
-"""FastAPI app. Started as Steven's standalone vision-workstream demo (camera ->
-discovery -> world model -> AR overlay, exercisable before the orchestration core
-existed); this file now also carries that missing core (Ojas.md §4, §6): the `/ws`
-endpoint, the 4Hz orchestrator tick, and the join/state endpoints the frontend and
-worker phones need. Endpoints match docs/CONTRACTS.md where it overlaps."""
+"""HIVE backend entry point."""
+
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import socket
-import time
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
-import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
-from app import orchestrator
-from app.config import settings
-from app.demo.simulator import Simulator
-from app.models import utc_now
-from app.state import InboundMessage, state
-from app.vision.calibration import Calibration
-from app.vision.camera import Camera
-from app.vision.world_model import WorldModel
-from app.websocket_manager import SlotsFull, ws
+from . import orchestrator
+from .config import join_url, lan_ip, settings
+from .demo.scenarios import SCENARIOS
+from .models import InboundMessage
+from .perception import nim_client
+from .perception.analyzer import analyzer
+from .state import state
+from .websocket_manager import SlotsFull, ws
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("hive.main")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+log = logging.getLogger("hive")
 
-app = FastAPI(title="HIVE")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# CV discovery runs on a downscaled copy of the display frame so a higher
-# capture resolution (for stream quality) doesn't slow down the world-model
-# tick — Detection positions are normalized, so resolution is irrelevant to
-# the resulting object/zone coordinates.
-PROCESS_WIDTH = 640
-PROCESS_HEIGHT = 360
-JPEG_QUALITY = 92
-
-camera = Camera(index=settings.camera_index)
-world_model = WorldModel(state)
-calibration = Calibration(world_model.discovery)
-simulator = Simulator(state)
-
-_vision_task: asyncio.Task | None = None
-_tick_task: asyncio.Task | None = None
-_boot_time = time.time()
+ROOT = Path(__file__).resolve().parents[2]
 
 
-def lan_ip() -> str:
-    """Best-effort local network IP. Does not actually send a packet."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    world_model.load_profile()
-    state.world.mode = settings.world_mode
-    if settings.world_mode == "simulation":
-        simulator.spawn_scene(n=5)
-    global _vision_task, _tick_task
-    _vision_task = asyncio.create_task(_vision_loop())
-    _tick_task = asyncio.create_task(orchestrator.run_forever())
-    if settings.demo_mode:
-        log.info("DEMO MODE — join at http://%s:5173/join", lan_ip())
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    for task in (_vision_task, _tick_task):
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await state.reset()
+    app.state.tick = asyncio.create_task(orchestrator.run_forever())
+    app.state.probe = asyncio.create_task(_startup_probe())
+    log.info("HIVE online — host http://localhost:%d/host", settings.frontend_port)
+    log.info("             join %s", join_url())
+    yield
+    for t in ("tick", "probe"):
+        task = getattr(app.state, t, None)
         if task:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with suppress(asyncio.CancelledError):
                 await task
-    camera.release()
+    from .vision import bridge
+
+    bridge.release_camera()
 
 
-async def _vision_loop() -> None:
-    """Frame-driven, not polled: blocks on the next captured frame rather than
-    sleeping a fixed interval, so the world model tracks the camera's actual
-    cadence. Never blocks the event loop, never raises out of the loop."""
-    frame_count = 0
-    fps_window_start = time.time()
-    last_version = 0
-    while True:
-        try:
-            if state.world.mode == "live":
-                if not camera.online:
-                    camera.maybe_reopen()
-                if camera.online:
-                    frame, last_version = await asyncio.to_thread(
-                        camera.wait_for_new_frame, last_version, 1.0
-                    )
-                    if frame is not None:
-                        small = cv2.resize(frame, (PROCESS_WIDTH, PROCESS_HEIGHT))
-                        detections = world_model.discovery.discover(small, calibration)
-                        world_model.ingest(detections)
-                        state.world.camera_online = True
-                        state.world.last_frame_at = utc_now()
-                        frame_count += 1
-                else:
-                    state.world.camera_online = False
-                    await asyncio.sleep(0.2)
-            else:
-                await asyncio.sleep(0.2)
-            now = time.time()
-            if now - fps_window_start >= 1.0:
-                state.world.vision_fps = frame_count / (now - fps_window_start)
-                frame_count = 0
-                fps_window_start = now
-        except Exception:
-            log.exception("vision tick")
-            await asyncio.sleep(0.1)
+async def _startup_probe() -> None:
+    """Discover which models this account can actually reach, and warm the camera.
 
-
-# ---- WebSocket ------------------------------------------------------------
-
-@app.websocket("/ws")
-async def ws_endpoint(sock: WebSocket, role: str = "host", token: str | None = None) -> None:
-    await sock.accept()
-    worker = None
-    try:
-        if role == "worker":
-            try:
-                worker = await ws.connect_worker(sock, token)
-            except SlotsFull:
-                return
-        else:
-            await ws.connect_host(sock)
-        await ws.send_snapshot(sock)
-        while True:
-            raw = await sock.receive_json()
-            state.inbox.append(InboundMessage(
-                type=raw["type"], payload=raw.get("payload", {}),
-                worker_id=worker.id if worker else None, role=role,
-            ))
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await ws.disconnect(sock)
-
-
-# ---- HTTP endpoints -----------------------------------------------------
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return """
-    <html><body style="font-family: sans-serif; padding: 2rem;">
-      <h2>HIVE</h2>
-      <ul>
-        <li><a href="/api/vision/frame.mjpg">/api/vision/frame.mjpg</a> — live MJPEG stream</li>
-        <li><a href="/api/health">/api/health</a></li>
-        <li><a href="/api/vision/scene">/api/vision/scene</a></li>
-        <li><a href="/api/join-info">/api/join-info</a></li>
-        <li><a href="/api/events">/api/events</a></li>
-        <li><a href="/docs">/docs</a> — full API (FastAPI auto docs)</li>
-      </ul>
-    </body></html>
+    Free hosted endpoints vary by account, so the stack self-configures rather than
+    trusting a hardcoded model id.
     """
+    await analyzer.probe()
+    if analyzer.reasoner:
+        await state.emit(
+            "perception_ready",
+            f"Scene reasoning online ({analyzer.reasoner.split('/')[-1]}).",
+            severity="success",
+        )
+    elif settings.has_model_access:
+        await state.emit(
+            "perception_degraded",
+            "Scene reasoning unavailable for this account — running on computer vision alone.",
+            severity="warn",
+        )
+
+    await state.emit(
+        "planner_ready",
+        "Task compiler ready — template library resident, model refinement in background.",
+        severity="info",
+    )
+
+    if settings.world_mode in ("live", "assisted"):
+        from .vision import bridge
+
+        # Open during startup, never during the demo: on macOS the first read triggers
+        # the permission prompt, and a permission dialog on stage is a disaster.
+        ok = await asyncio.to_thread(bridge.open_camera)
+        state.world.camera_online = ok
+        state.world.mode = settings.world_mode if ok else "simulation"  # type: ignore[assignment]
+        await state.emit(
+            "camera_status",
+            f"Camera {settings.camera_index} online." if ok else "No camera — running in simulation.",
+            severity="success" if ok else "warn",
+        )
+
+
+app = FastAPI(title="HIVE", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+
+# ── HTTP ────────────────────────────────────────────────────────────────────
 
 
 @app.get("/api/health")
 async def health():
+    from .vision import bridge
+
     return {
         "ok": True,
         "mode": state.world.mode,
-        "camera_online": state.world.camera_online,
-        "camera_resolution": f"{camera.actual_width}x{camera.actual_height}",
-        "camera_fps": round(camera.actual_fps, 1),
-        "vision_fps": round(state.world.vision_fps, 1),
-        "workers_connected": sum(1 for w in state.workers if w.connected),
         "execution_status": state.execution_status,
-        "uptime": round(time.time() - _boot_time, 1),
+        "workers_connected": sum(1 for w in state.workers.values() if w.connected),
+        "scenario": state.scenario.id,
+        "camera": {"online": bridge.camera_online(), "index": bridge.camera().index, "fps": bridge.camera_fps()},
+        "models": nim_client.health(),
+        "perception": analyzer.health(),
+        "planner": {"model": settings.planner_model, "mode": "template-first, model upgrade in background"},
+        "demo_mode": settings.demo_mode,
     }
 
 
 @app.get("/api/join-info")
 async def join_info():
-    ip = lan_ip()
-    return {"url": f"http://{ip}:5173/join", "lan_ip": ip, "port": settings.port}
+    return {"url": join_url(), "lan_ip": lan_ip(), "port": settings.frontend_port}
 
 
 @app.get("/api/state")
-async def api_state():
-    return ws._snapshot()
+async def get_state():
+    return state.snapshot()
 
 
-@app.post("/api/vision/warmup")
-async def warmup():
-    """Open the camera during setup, not during the demo — triggers the macOS
-    permission prompt ahead of time."""
-    ok = camera.open()
-    return {"ok": ok, "online": camera.online}
+@app.get("/api/scenarios")
+async def scenarios():
+    return [
+        {"id": s.id, "title": s.title, "subtitle": s.subtitle, "suggested_goal": s.suggested_goal}
+        for s in SCENARIOS.values()
+    ]
 
 
-class ScanRequest(BaseModel):
-    relabel: bool = True
+@app.get("/api/vision/cameras")
+async def cameras():
+    from .vision.camera import probe_cameras
+
+    return await asyncio.to_thread(probe_cameras)  # noqa: F401
 
 
-@app.post("/api/vision/scan")
-async def scan(req: ScanRequest = ScanRequest()):
-    if state.world.mode == "simulation":
-        simulator.spawn_scene(n=len(state.scene.objects) or 5)
-        return _scene_json()
+@app.post("/api/vision/select/{index}")
+async def select_camera(index: int):
+    from .vision import bridge
 
-    if not camera.online:
-        camera.open()
-    frame = await asyncio.to_thread(camera.read)
-    if frame is None:
-        return JSONResponse({"error": "no frame available"}, status_code=503)
-
-    world_model.rebuild_scene(frame)
-    await asyncio.sleep(1.5)  # let discovery settle over a few frames before declaring stable
-    world_model.mark_scene_stable()
-    return _scene_json()
-
-
-def _scene_json():
-    scene = state.scene
-    return {
-        "objects": [o.model_dump(mode="json") for o in scene.objects],
-        "zones": [z.model_dump(mode="json") for z in scene.zones],
-        "scanned_at": scene.scanned_at.isoformat(),
-        "object_count": scene.object_count,
-        "labeling_source": scene.labeling_source,
-        "stable": scene.stable,
-    }
-
-
-@app.get("/api/vision/scene")
-async def get_scene():
-    return _scene_json()
+    ok = await asyncio.to_thread(bridge.open_camera, index)
+    state.world.camera_online = ok
+    if ok:
+        settings.camera_index = index
+        state.world.mode = "live"  # type: ignore[assignment]
+    return {"ok": ok, "index": index}
 
 
 @app.get("/api/vision/frame.mjpg")
-async def mjpeg_stream():
+async def mjpeg():
+    """MJPEG chosen over WebRTC deliberately: ~20 lines, no negotiation, works everywhere."""
+    from .vision import bridge
+
     async def gen():
-        last_version = 0
+        boundary = b"--frame\r\n"
         while True:
-            frame = None
-            if state.world.mode == "live" and camera.online:
-                frame, last_version = await asyncio.to_thread(
-                    camera.wait_for_new_frame, last_version, 1.0
-                )
-                if calibration.state.show_mask and frame is not None:
-                    world_model.discovery.discover(frame, calibration)
-                    mask = world_model.discovery.last_mask()
-                    if mask is not None:
-                        frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            if frame is None:
-                frame = _placeholder_frame()
-                await asyncio.sleep(0.1)  # avoid a busy loop when nothing is live
-            ok, buf = await asyncio.to_thread(
-                cv2.imencode, ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-            )
-            if ok:
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+            jpeg = bridge.snapshot_jpeg()
+            if jpeg:
+                yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+            await asyncio.sleep(1 / 15)
 
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
-def _placeholder_frame():
-    import numpy as np
-    img = np.zeros((360, 640, 3), np.uint8)
-    img[:] = (30, 30, 30)
-    cv2.putText(img, "NO CAMERA - simulation mode", (40, 180),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 220, 120), 2, cv2.LINE_AA)
-    return img
+@app.get("/api/voygr/usage")
+async def voygr_usage():
+    from .integrations.voygr import usage
+
+    return await usage()
 
 
-class ZoneRequest(BaseModel):
-    zone_id: str | None = None
-    bounds: tuple[float, float, float, float]
-    label: str
+# ── WebSocket ───────────────────────────────────────────────────────────────
 
 
-@app.post("/api/vision/zones")
-async def define_zone(req: ZoneRequest):
-    zone = world_model.define_zone(req.zone_id, req.bounds, req.label)
-    world_model.save_profile()
-    return zone.model_dump(mode="json")
+@app.websocket("/ws")
+async def ws_endpoint(sock: WebSocket, role: str = "host", token: str | None = None):
+    await sock.accept()
+    worker = None
+    try:
+        if role == "worker":
+            worker = await ws.connect_worker(sock, token)
+        else:
+            await ws.connect_host(sock)
+        await ws.send_snapshot(sock, role, worker.id if worker else None)
+
+        while True:
+            raw = await sock.receive_json()
+            mtype = raw.get("type")
+            if not mtype:
+                continue
+            # Workers may only send worker_* messages. A phone can never drive the host.
+            if role == "worker" and not mtype.startswith("worker_"):
+                continue
+            state.inbox.append(
+                InboundMessage(
+                    type=mtype,
+                    payload=raw.get("payload") or {},
+                    worker_id=worker.id if worker else None,
+                    role=role,
+                )
+            )
+    except (WebSocketDisconnect, SlotsFull):
+        pass
+    except Exception:
+        log.debug("ws error", exc_info=True)
+    finally:
+        await ws.disconnect(sock)
 
 
-@app.post("/api/vision/detect-zones")
-async def detect_zones_endpoint():
-    if not camera.online:
-        return JSONResponse({"error": "camera not online"}, status_code=503)
-    frame = await asyncio.to_thread(camera.read)
-    if frame is None:
-        return JSONResponse({"error": "no frame available"}, status_code=503)
-    return {"proposed": world_model.detect_zones_from_frame(frame)}
-
-
-class CalibrateRequest(BaseModel):
-    saliency_bias: int | None = None
-    min_area_frac: float | None = None
-    max_area_frac: float | None = None
-    show_mask: bool | None = None
-
-
-@app.post("/api/vision/calibrate")
-async def calibrate(req: CalibrateRequest):
-    if req.saliency_bias is not None:
-        calibration.set_saliency(req.saliency_bias)
-    if req.min_area_frac is not None or req.max_area_frac is not None:
-        calibration.set_area_bounds(req.min_area_frac, req.max_area_frac)
-    if req.show_mask is not None:
-        calibration.toggle_mask(req.show_mask)
-    return {"ok": True, "state": calibration.state.__dict__}
-
-
-class SetModeRequest(BaseModel):
-    mode: str
-
-
-@app.post("/api/vision/mode")
-async def set_mode(req: SetModeRequest):
-    if req.mode not in ("live", "assisted", "simulation"):
-        return JSONResponse({"error": "invalid mode"}, status_code=400)
-    state.world.mode = req.mode
-    if req.mode == "simulation" and not state.scene.objects:
-        simulator.spawn_scene(n=5)
-    return {"ok": True, "mode": state.world.mode}
-
-
-@app.get("/api/events")
-async def events():
-    return [e.model_dump(mode="json") for e in state.events[-50:]]
-
-
-_dist_path = None
-with contextlib.suppress(Exception):
-    from pathlib import Path
-
-    _candidate = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-    if _candidate.exists():
-        _dist_path = _candidate
-
-if _dist_path is not None:
-    from fastapi.staticfiles import StaticFiles
-
-    app.mount("/", StaticFiles(directory=str(_dist_path), html=True), name="ui")
+# Mount the built frontend LAST, or it swallows /api and /ws.
+_dist = ROOT / "frontend" / "dist"
+if _dist.exists():
+    app.mount("/", StaticFiles(directory=str(_dist), html=True), name="ui")

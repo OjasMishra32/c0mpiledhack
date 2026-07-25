@@ -1,27 +1,18 @@
-"""HIVE shared data models — the Pydantic source of truth (docs/CONTRACTS.md §1–§2).
+"""HIVE data model. Mirrors docs/CONTRACTS.md and frontend/src/types/hive.ts.
 
-Field names are snake_case and structurally identical to `frontend/src/types/hive.ts`.
-
-Nothing in here is scenario-specific. Objects and zones are *discovered* at runtime with
-measured descriptors; meaning arrives later from grounding and lives in `role`. There is no
-object manifest anywhere in HIVE.
+Field names are snake_case on BOTH sides of the wire. No mapping layer, no camelCase.
+If you change something here, change hive.ts and CONTRACTS.md in the same commit.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# ── §1 Enums ────────────────────────────────────────────────────────────────────
-# Strings, not ints. They serialize as-is.
-
+# ── enums (plain string literals; they serialize as-is) ──────────────────────
 
 class WorkerStatus(str, Enum):
     disconnected = "disconnected"
@@ -50,38 +41,6 @@ class ActionStatus(str, Enum):
     recovery = "recovery"
 
 
-class GoalStatus(str, Enum):
-    draft = "draft"
-    compiling = "compiling"
-    compiled = "compiled"
-    executing = "executing"
-    paused = "paused"
-    completed = "completed"
-    failed = "failed"
-    aborted = "aborted"
-
-
-class PlanSource(str, Enum):
-    llm = "llm"
-    template = "template"
-    demo_script = "demo_script"
-    manual = "manual"
-
-
-class WorldMode(str, Enum):
-    live = "live"
-    assisted = "assisted"
-    simulation = "simulation"
-
-
-class Severity(str, Enum):
-    debug = "debug"
-    info = "info"
-    warn = "warn"
-    critical = "critical"
-    success = "success"
-
-
 class ActionType(str, Enum):
     pick_up = "pick_up"
     move_to_zone = "move_to_zone"
@@ -107,92 +66,102 @@ class PredicateType(str, Enum):
     manually_verified = "manually_verified"
 
 
-class EvidenceKind(str, Enum):
-    vision = "vision"
-    vlm = "vlm"
-    worker_report = "worker_report"
-    host_override = "host_override"
-    simulation = "simulation"
-    timing = "timing"
-    inference = "inference"
+GoalStatus = Literal["draft", "compiling", "compiled", "executing", "paused", "completed", "failed", "aborted"]
+PlanSource = Literal["llm", "template", "demo_script", "manual"]
+WorldMode = Literal["live", "assisted", "simulation"]
+Severity = Literal["debug", "info", "warn", "critical", "success"]
+EvidenceKind = Literal[
+    "vision", "vlm", "worker_report", "host_override", "simulation", "timing",
+    "inference", "system",
+]
+ZoneStatus = Literal["unknown", "pending", "active", "satisfied", "blocked"]
+ExecutionStatus = Literal["idle", "planning", "executing", "paused", "completed", "emergency"]
 
+SUPPORTED_ACTIONS: list[str] = [
+    "pick_up", "move_to_zone", "place_in_zone", "place_on", "hold", "release", "inspect",
+]
 
-class PerceptionTier(str, Enum):
-    cv = "cv"
-    vlm_fast = "vlm_fast"
-    vlm_reason = "vlm_reason"
-
-
-SUPPORTED_ACTIONS: list[str] = [t.value for t in ActionType]
-
+# Evidence weights. Single source of truth — verifier.py imports these, never redefines.
 EVIDENCE_WEIGHTS: dict[str, float] = {
-    EvidenceKind.vision.value: 0.60,
-    EvidenceKind.vlm.value: 0.55,
-    EvidenceKind.worker_report.value: 0.30,
-    EvidenceKind.host_override.value: 1.00,
-    EvidenceKind.simulation.value: 0.95,
-    EvidenceKind.timing.value: 0.10,
-    EvidenceKind.inference.value: 0.15,
+    "vision": 0.60,
+    "vlm": 0.55,
+    "worker_report": 0.30,
+    "simulation": 0.95,
+    "host_override": 1.00,
+    "timing": 0.10,
+    "inference": 0.15,
+    # Derived from HIVE's own verified records (e.g. "all prerequisites verified").
+    # Not a sensor reading, so it is not hedged like one.
+    "system": 0.90,
 }
 
 
-# ── §2 Core models ──────────────────────────────────────────────────────────────
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-class Base(BaseModel):
-    model_config = ConfigDict(extra="ignore", use_enum_values=True)
+# ── geometry ────────────────────────────────────────────────────────────────
 
 
-class Vec2(Base):
-    x: float
-    y: float
+class _Base(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
 
 
-class Bounds(Base):
-    """Normalized rectangle, origin top-left of the camera frame. There are no pixels here."""
+class Point(_Base):
+    x: float = 0.5
+    y: float = 0.5
 
+    def dist(self, other: "Point") -> float:
+        return ((self.x - other.x) ** 2 + (self.y - other.y) ** 2) ** 0.5
+
+
+class Rect(_Base):
     x: float
     y: float
     w: float
     h: float
 
-    def contains(self, p: Vec2) -> bool:
-        return self.x <= p.x <= self.x + self.w and self.y <= p.y <= self.y + self.h
+    def contains(self, p: Point, margin: float = 0.0) -> bool:
+        return (
+            self.x - margin <= p.x <= self.x + self.w + margin
+            and self.y - margin <= p.y <= self.y + self.h + margin
+        )
 
     @property
-    def center(self) -> Vec2:
-        return Vec2(x=self.x + self.w / 2, y=self.y + self.h / 2)
+    def center(self) -> Point:
+        return Point(x=self.x + self.w / 2, y=self.y + self.h / 2)
 
 
-class Descriptor(Base):
-    """Everything here is MEASURED by the vision pipeline. Nothing is configured."""
+# ── perception ──────────────────────────────────────────────────────────────
 
-    dominant_hsv: list[int] = Field(default_factory=lambda: [0, 0, 0])
+
+class Descriptor(_Base):
+    """Everything here is MEASURED from the frame. Nothing is configured."""
+
+    dominant_hsv: tuple[int, int, int] = (0, 0, 0)
     color_name: str = "unknown"
-    color_hex: str = "#8E8E93"
+    color_hex: str = "#888888"
     area_norm: float = 0.0
     aspect: float = 1.0
     circularity: float = 0.0
-    shape_hint: str = "irregular"  # round | rectangular | irregular
+    shape_hint: str = "irregular"
 
 
-class ObservedObject(Base):
+class ObservedObject(_Base):
     id: str
-
-    # measured
     descriptor: Descriptor = Field(default_factory=Descriptor)
-    position: Vec2 = Field(default_factory=lambda: Vec2(x=0.5, y=0.5))
+    position: Point = Field(default_factory=Point)
     zone: str = "field"
     visible: bool = True
-    confidence: float = 1.0
-    first_seen_at: datetime = Field(default_factory=utc_now)
-    last_updated_at: datetime = Field(default_factory=utc_now)
-    source: str = "vision"  # vision | simulation | host_override
+    confidence: float = 0.9
+    first_seen_at: str = Field(default_factory=now_iso)
+    last_updated_at: str = Field(default_factory=now_iso)
+    source: str = "simulation"  # vision | vlm | simulation | host_override
 
-    # assigned by semantic labeling + grounding
+    # assigned by semantic labeling + grounding, not by perception
     semantic_label: str | None = None
     role: str | None = None
-    role_confidence: float | None = None
+    role_confidence: float = 0.0
 
     # runtime
     held_by: str | None = None
@@ -200,176 +169,246 @@ class ObservedObject(Base):
     locked_by: str | None = None
 
     def display_label(self) -> str:
-        """role ?? semantic_label ?? "{color_name} {shape_hint} object"."""
         if self.role:
             return self.role
         if self.semantic_label:
             return self.semantic_label
-        return f"{self.descriptor.color_name} {self.descriptor.shape_hint} object"
+        d = self.descriptor
+        return f"{d.color_name} {d.shape_hint} object".strip()
 
 
-class Zone(Base):
+class Zone(_Base):
     id: str
     label: str
-    bounds: Bounds
+    bounds: Rect
     occupancy: list[str] = Field(default_factory=list)
-    status: str = "pending"  # unknown | pending | active | satisfied | blocked
-    source: str = "detected"  # detected | drawn | inferred
+    status: ZoneStatus = "unknown"
+    source: str = "drawn"  # detected | drawn | inferred
 
 
-class Scene(Base):
-    """The discovery result. Produced on *Scan Scene*, refreshed continuously."""
-
+class Scene(_Base):
     objects: list[ObservedObject] = Field(default_factory=list)
     zones: list[Zone] = Field(default_factory=list)
-    scanned_at: datetime = Field(default_factory=utc_now)
-    object_count: int = 0
-    labeling_source: str = "descriptor"  # vlm | descriptor | none
+    scanned_at: str = Field(default_factory=now_iso)
+    labeling_source: str = "none"  # vlm | descriptor | none
     stable: bool = True
+    object_count: int = 0
 
-    def by_id(self, object_id: str) -> ObservedObject | None:
-        return next((o for o in self.objects if o.id == object_id), None)
+    def by_id(self, oid: str) -> ObservedObject | None:
+        return next((o for o in self.objects if o.id == oid), None)
 
-    def zone_by_id(self, zone_id: str) -> Zone | None:
-        return next((z for z in self.zones if z.id == zone_id), None)
+    def zone_by_id(self, zid: str) -> Zone | None:
+        return next((z for z in self.zones if z.id == zid), None)
 
-    def zone_label(self, zone_id: str) -> str:
-        zone = self.zone_by_id(zone_id)
-        return zone.label if zone else ("the floor" if zone_id == "field" else zone_id)
+    def zone_label(self, zid: str) -> str:
+        z = self.zone_by_id(zid)
+        return z.label if z else ("the open floor" if zid == "field" else zid)
+
+    def label_of(self, oid: str) -> str:
+        o = self.by_id(oid)
+        return o.display_label() if o else oid
 
     @property
-    def visible_objects(self) -> list[ObservedObject]:
+    def visible_objects(self) -> list["ObservedObject"]:
         return [o for o in self.objects if o.visible]
 
 
-class Worker(Base):
+class WorldState(_Base):
+    """Camera/vision status. The scene itself lives on HiveState.scene."""
+
+    # Convenience mirror of scene.objects that the vision pipeline writes. Excluded from
+    # serialization so the wire payload keeps exactly one source of truth for objects.
+    objects: list[ObservedObject] = Field(default_factory=list, exclude=True)
+    mode: WorldMode = "simulation"
+    camera_online: bool = False
+    vision_fps: float = 0.0
+    last_frame_at: str | None = None
+    vlm_fast_online: bool = False
+    vlm_reason_online: bool = False
+    vlm_hz: float = 0.0
+    narration: str | None = None
+    people: list[dict[str, Any]] = Field(default_factory=list)
+    anomalies: list[str] = Field(default_factory=list)
+
+
+# ── workers ─────────────────────────────────────────────────────────────────
+
+
+class Worker(_Base):
     id: str
     display_name: str
     callsign: str
     color: str
-    status: str = WorkerStatus.disconnected.value
+    role: str = "Operator"
+    status: WorkerStatus = "disconnected"
     connected: bool = False
     available: bool = True
     current_action_id: str | None = None
-    reachable_zones: list[str] = Field(default_factory=lambda: ["field"])
-    role: str | None = None
+    reachable_zones: list[str] = Field(default_factory=list)
     supported_actions: list[str] = Field(default_factory=lambda: list(SUPPORTED_ACTIONS))
-    position: Vec2 = Field(default_factory=lambda: Vec2(x=0.5, y=0.5))
-    last_seen_at: datetime | None = None
+    position: Point = Field(default_factory=Point)
+    last_seen_at: str = Field(default_factory=now_iso)
     assignment_count: int = 0
     confidence: float = 1.0
-    # never sent to the host UI, never logged — excluded from every model_dump()
-    session_token: str | None = Field(default=None, repr=False, exclude=True)
+    session_token: str | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        """Never leak session_token outward."""
+        d = self.model_dump()
+        d.pop("session_token", None)
+        return d
 
 
-class Predicate(Base):
-    type: str
+# ── plan ────────────────────────────────────────────────────────────────────
+
+
+class Predicate(_Base):
+    type: PredicateType
     subject: str
     object: str | None = None
-    tolerance: float | None = None
+    tolerance: float | None = 0.12  # None where proximity is meaningless
 
 
-class Instruction(Base):
-    """What lands on a phone. Generated at dispatch time, never before.
+class Evidence(_Base):
+    kind: EvidenceKind
+    confidence: float = 1.0
+    weight: float = 0.0
+    detail: str = ""
+    at: str = Field(default_factory=now_iso)
 
-    `id` MUST be unique per (action, attempt) — the worker client keys speech off it.
-    """
+    def model_post_init(self, __ctx: Any) -> None:  # noqa: D105
+        if not self.weight:
+            self.weight = EVIDENCE_WEIGHTS.get(self.kind, 0.1)
 
+
+class Instruction(_Base):
     id: str
     action_id: str
     worker_id: str
     display_text: str
     spoken_text: str
-    detail_text: str | None = None
-    urgency: str = "normal"  # normal | high | critical
+    detail_text: str = ""
+    urgency: Literal["normal", "high", "critical"] = "normal"
     expected_duration_seconds: int = 12
     requires_verification: bool = True
     correction_text: str | None = None
-    issued_at: datetime = Field(default_factory=utc_now)
+    issued_at: str = Field(default_factory=now_iso)
 
 
-class Action(Base):
+class Action(_Base):
     id: str
-    type: str
+    type: str  # validated by planner.validator, not by the model
     description: str
     object_id: str | None = None
     target_object_id: str | None = None
     target_zone: str | None = None
     assigned_worker_id: str | None = None
-    assignment_reason: str | None = None
+    assignment_reason: str = ""
     dependencies: list[str] = Field(default_factory=list)
-    status: str = ActionStatus.queued.value
-    priority: int = 70
+    status: ActionStatus = "queued"
+    priority: int = 50
     timeout_seconds: int = 25
     expected_predicates: list[Predicate] = Field(default_factory=list)
     instruction: Instruction | None = None
+    evidence: list[Evidence] = Field(default_factory=list)
+    confidence: float = 0.0
     retry_count: int = 0
     max_retries: int = 2
+    attempt: int = 0
     is_recovery: bool = False
+    origin_zone: str | None = None
     blocked_reason: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
-    dispatched_at: datetime | None = None
-    completed_at: datetime | None = None
     lock_targets: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=now_iso)
+    dispatched_at: str | None = None
+    completed_at: str | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in ("verified", "cancelled")
 
 
-class Evidence(Base):
-    kind: str
-    confidence: float
-    weight: float
-    detail: str | None = None
-    at: datetime = Field(default_factory=utc_now)
-
-
-class Goal(Base):
+class Goal(_Base):
     id: str = "goal_1"
-    raw_text: str
+    raw_text: str = ""
     normalized_intent: str = ""
-    status: str = GoalStatus.draft.value
+    status: GoalStatus = "draft"
     success_predicates: list[Predicate] = Field(default_factory=list)
-    plan_source: str = PlanSource.template.value
+    plan_source: PlanSource = "template"
     planner_notes: str = ""
-    created_at: datetime = Field(default_factory=utc_now)
+    warnings: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=now_iso)
 
 
-class Event(Base):
+# ── events & metrics ────────────────────────────────────────────────────────
+
+
+class Event(_Base):
     id: str
     seq: int
-    timestamp: datetime = Field(default_factory=utc_now)
+    timestamp: str
     type: str
-    severity: str = Severity.info.value
+    severity: Severity = "info"
     actor: str = "hive"
-    message: str = ""
-    metadata: dict = Field(default_factory=dict)
+    message: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class WorldState(Base):
-    mode: str = WorldMode.simulation.value
-    objects: list[ObservedObject] = Field(default_factory=list)
-    zones: list[Zone] = Field(default_factory=list)
-    camera_online: bool = False
-    vision_fps: float = 0.0
-    last_frame_at: datetime | None = None
+class RunMetrics(_Base):
+    actions_total: int = 0
+    actions_verified: int = 0
+    parallel_peak: int = 0
+    recoveries: int = 0
+    reassignments: int = 0
+    deviations: int = 0
+    conflicts: int = 0
+    avg_confidence: float = 0.0
+    worker_idle_seconds: float = 0.0
+    started_at: str | None = None
+    completed_at: str | None = None
+    elapsed_seconds: float = 0.0
 
 
-class HiveState(Base):
-    """Provisional shape of the snapshot the host renders.
+# ── transport ───────────────────────────────────────────────────────────────
 
-    `orchestrator.py` owns the real one (Ojas). The planner and scheduler only read the
-    fields below and duck-type them, so a richer HiveState is a drop-in replacement.
+
+class InboundMessage(_Base):
+    type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    worker_id: str | None = None
+    role: str = "host"
+
+
+class Envelope(_Base):
+    type: str
+    payload: Any = None
+    ts: str = Field(default_factory=now_iso)
+    seq: int = 0
+
+
+# Aliases so modules authored against the contract's alternate names keep working.
+Vec2 = Point
+Bounds = Rect
+
+
+class PlannerState(_Base):
+    """List-shaped snapshot the planner and scheduler read.
+
+    The live `HiveState` (app/state.py) keys workers and actions by id because everything
+    else looks them up that way; these subsystems iterate. `orchestrator._SchedulerView`
+    adapts the real state onto this shape, and tests construct it directly.
     """
 
-    mode: str = WorldMode.simulation.value
+    mode: str = "simulation"
     scenario_id: str | None = None
     goal: Goal | None = None
     workers: list[Worker] = Field(default_factory=list)
     actions: list[Action] = Field(default_factory=list)
     scene: Scene = Field(default_factory=Scene)
-    locks: dict[str, str] = Field(default_factory=dict)  # lock_target -> action_id
+    locks: dict[str, str] = Field(default_factory=dict)
     events: list[Event] = Field(default_factory=list)
     lexicon: dict[str, str] = Field(default_factory=dict)
 
-    # convenience accessors the scheduler uses
     @property
     def objects(self) -> list[ObservedObject]:
         return self.scene.objects
@@ -383,3 +422,11 @@ class HiveState(Base):
 
     def action_by_id(self, action_id: str) -> Action | None:
         return next((a for a in self.actions if a.id == action_id), None)
+
+
+# Name the planner suite was authored against.
+HiveState = PlannerState
+
+
+# Alias: the vision workstream calls this one `utc_now`.
+utc_now = now_iso

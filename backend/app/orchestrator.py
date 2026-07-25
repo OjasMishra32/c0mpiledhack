@@ -1,320 +1,669 @@
-"""The 4Hz tick — the orchestration core (Ojas.md §4, §6).
+"""The orchestration loop — one clock, one writer, never raises.
 
-Fixed order, do not reorder:
-drain_inbox -> verify_pending -> complete_actions -> unlock_dependents ->
-detect_deviations -> detect_timeouts -> run_scheduler -> dispatch -> check_goal ->
-flush_broadcasts
+Only this module mutates Action.status, Worker.status, and locks. Everything else queues
+an inbox message and waits its turn. That single rule removes the entire class of
+"two things changed the same action in the same tick" bugs.
 
-Only `orchestrator.py` mutates `Action.status` / `Worker.status` / `locks`
-(docs/CONTRACTS.md §1) — `scheduler.py` and `recovery.py` return decisions, this file
-applies them. Vision's own async loop (main.py's `_vision_loop`) mutates
-`state.scene`/`state.world` independently; this tick never touches the camera."""
+Steps 2-11 of tick() are synchronous, so tests can call tick() directly.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from typing import Any
 
-from app import recovery, scheduler, verifier
-from app.config import settings
-from app.models import (
-    Action,
-    ActionStatus,
-    Evidence,
-    EvidenceKind,
-    EVIDENCE_WEIGHTS,
-    Goal,
-    Instruction,
-    WorkerStatus,
-    utc_now,
-)
-from app.state import state
-from app.websocket_manager import ws
+from . import recovery as recovery_engine
+from .attribution import attribution
+from . import scheduler, verifier
+from .config import settings
+from .models import Action, Evidence, Instruction, now_iso
+from .state import state
+from .vision import bridge as world_model
+from .websocket_manager import ws
 
 log = logging.getLogger("hive.orchestrator")
 
-
-# ── inbox handlers ───────────────────────────────────────────────────────────────
-
-def drain_inbox() -> None:
-    while state.inbox:
-        msg = state.inbox.pop(0)
-        handler = HANDLERS.get(msg.type)
-        if not handler:
-            continue
-        try:
-            handler(msg)
-        except Exception:
-            log.exception("handler %s failed", msg.type)
+DISPATCHABLE = ("dispatched", "acknowledged", "executing")
 
 
-def on_worker_completed(msg) -> None:
-    a = state.action_by_id(msg.payload.get("action_id"))
-    if not a or a.assigned_worker_id != msg.worker_id:
-        return
-    if a.status in (ActionStatus.verified.value, ActionStatus.cancelled.value, ActionStatus.failed.value):
-        return
-    evidence = state.evidence.setdefault(a.id, [])
-    if any(e.kind == EvidenceKind.worker_report.value for e in evidence):
-        return
-    evidence.append(Evidence(
-        kind=EvidenceKind.worker_report.value,
-        confidence=msg.payload.get("confidence") or 1.0,
-        weight=EVIDENCE_WEIGHTS[EvidenceKind.worker_report.value],
-    ))
-    a.status = ActionStatus.awaiting_verification.value
-
-
-def on_worker_acknowledged(msg) -> None:
-    a = state.action_by_id(msg.payload.get("action_id"))
-    if a and a.status == ActionStatus.dispatched.value:
-        a.status = ActionStatus.acknowledged.value
-
-
-def on_worker_blocked(msg) -> None:
-    a = state.action_by_id(msg.payload.get("action_id"))
-    if a:
-        a.status = ActionStatus.blocked.value
-
-
-def on_worker_pause(msg) -> None:
-    w = state.worker_by_id(msg.worker_id)
-    if w:
-        w.status = WorkerStatus.paused.value
-
-
-def on_worker_ready(msg) -> None:
-    w = state.worker_by_id(msg.worker_id)
-    if w and w.status != WorkerStatus.executing.value:
-        w.status = WorkerStatus.ready.value
-
-
-def on_worker_emergency(msg) -> None:
-    state.execution_status = "emergency"
-    asyncio.create_task(state.emit(
-        "emergency_stop", f"Emergency stop triggered by {msg.worker_id or 'host'}.", severity="critical",
-    ))
-
-
-def on_host_manual_verify(msg) -> None:
-    action_id = msg.payload.get("action_id")
-    if not msg.payload.get("verified", True):
-        return
-    a = state.action_by_id(action_id)
-    if not a:
-        return
-    state.evidence.setdefault(a.id, []).append(Evidence(
-        kind=EvidenceKind.host_override.value, confidence=1.0,
-        weight=EVIDENCE_WEIGHTS[EvidenceKind.host_override.value],
-    ))
-
-
-def on_host_start_execution(msg) -> None:
-    if state.actions:
-        state.execution_status = "executing"
-
-
-def on_host_pause_all(msg) -> None:
-    if state.execution_status == "executing":
-        state.execution_status = "paused"
-
-
-def on_host_resume_all(msg) -> None:
-    if state.execution_status == "paused":
-        state.execution_status = "executing"
-
-
-def on_host_reset(msg) -> None:
-    asyncio.create_task(state.reset(msg.payload.get("scenario_id")))
-
-
-def on_host_compile_goal(msg) -> None:
-    asyncio.create_task(_compile_goal_task(msg.payload.get("text", ""), msg.payload.get("scenario_id")))
-
-
-async def _compile_goal_task(text: str, scenario_id: str | None) -> None:
-    """Calls Zechariah's planner (the only entry point: `compile_goal`) and installs
-    the result. Grounding-ambiguous plans emit `grounding_ambiguous` themselves
-    (planner/base.py) and return a pending PlanResult — resuming that with
-    `host_bind_object` is grounding/host-UI scope, not wired here yet."""
-    from app.planner.base import NotReady, compile_goal
-
-    def _emit(kind: str, payload: dict):
-        return state.emit(kind, kind, metadata=payload)
-
-    try:
-        result = await compile_goal(text, state.scene, state.workers, scenario_id=scenario_id, emit=_emit)
-    except NotReady as exc:
-        await state.emit("error_event", str(exc), severity="warn")
-        return
-    except Exception:
-        log.exception("compile_goal failed")
-        await state.emit("error_event", "Goal compilation failed unexpectedly.", severity="warn")
-        return
-
-    if result.is_pending:
-        return
-
-    state.goal = Goal(
-        raw_text=text, normalized_intent=result.normalized_intent, status="compiled",
-        success_predicates=result.success_predicates, plan_source=result.source,
-        planner_notes=result.notes,
-    )
-    state.actions = result.actions
-    state.scenario_id = scenario_id or state.scenario_id
-    await state.emit("plan_compiled", result.notes or "Plan compiled.",
-                      metadata={"source": result.source, "stats": result.stats})
-    await ws.broadcast_snapshot()
-
-
-HANDLERS = {
-    "worker_completed": on_worker_completed,
-    "worker_acknowledged": on_worker_acknowledged,
-    "worker_blocked": on_worker_blocked,
-    "worker_pause": on_worker_pause,
-    "worker_ready": on_worker_ready,
-    "worker_emergency": on_worker_emergency,
-    "host_manual_verify": on_host_manual_verify,
-    "host_start_execution": on_host_start_execution,
-    "host_pause_all": on_host_pause_all,
-    "host_resume_all": on_host_resume_all,
-    "host_reset": on_host_reset,
-    "host_compile_goal": on_host_compile_goal,
-}
-
-
-# ── tick steps ───────────────────────────────────────────────────────────────────
-
-def verify_pending() -> None:
-    for a in state.actions:
-        if a.status != ActionStatus.awaiting_verification.value:
-            continue
-        result = verifier.evaluate(a, state)
-        if result.verified:
-            a.status = ActionStatus.verified.value
-            state.mark_world_dirty()
-
-
-def complete_actions() -> None:
-    for a in state.actions:
-        if a.status == ActionStatus.verified.value and a.completed_at is None:
-            a.completed_at = utc_now()
-            for lock in a.lock_targets:
-                if state.locks.get(lock) == a.id:
-                    del state.locks[lock]
-            w = state.worker_by_id(a.assigned_worker_id) if a.assigned_worker_id else None
-            if w:
-                w.current_action_id = None
-                w.status = WorkerStatus.ready.value
-
-
-def unlock_dependents() -> None:
-    for a in scheduler.unlock_dependents(state, []):
-        a.status = ActionStatus.available.value
-
-
-async def detect_deviations() -> None:
-    for trigger in recovery.detect_all(state):
-        plan = recovery.plan_recovery(trigger, state)
-        await recovery.apply_recovery_plan(plan, state)
-
-
-async def detect_timeouts() -> None:
-    now = utc_now()
-    for a in state.actions:
-        if a.status not in (ActionStatus.dispatched.value, ActionStatus.executing.value):
-            continue
-        if not a.dispatched_at:
-            continue
-        if (now - a.dispatched_at).total_seconds() > a.timeout_seconds:
-            trigger = recovery.DeviationTrigger(kind="worker_timeout", action_id=a.id,
-                                                 worker_id=a.assigned_worker_id, detail="timeout")
-            plan = recovery.plan_recovery(trigger, state)
-            await recovery.apply_recovery_plan(plan, state)
-
-
-async def run_scheduler() -> None:
-    """Zechariah's scheduler: pure scoring + a set-per-tick batch. This is the only
-    place that turns its decisions into mutation (assignment + lock acquisition)."""
-    result = scheduler.assign_actions(state)
-    for action, assignment in result.batch:
-        action.assigned_worker_id = assignment.worker_id
-        action.assignment_reason = assignment.reason
-        action.status = ActionStatus.assigned.value
-        for lock in action.lock_targets:
-            state.locks[lock] = action.id
-        w = state.worker_by_id(assignment.worker_id)
-        if w:
-            w.assignment_count += 1
-
-    if result.deadlock:
-        trigger = recovery.DeviationTrigger(kind="scheduler_deadlock", detail=result.deadlock,
-                                             human_readable=result.deadlock)
-        plan = recovery.plan_recovery(trigger, state)
-        await recovery.apply_recovery_plan(plan, state)
-
-
-def dispatch() -> None:
-    for a in state.actions:
-        if a.status != ActionStatus.assigned.value or not a.assigned_worker_id:
-            continue
-        w = state.worker_by_id(a.assigned_worker_id)
-        if not w:
-            continue
-        attempt = a.retry_count + 1
-        a.instruction = Instruction(
-            id=f"instr_{a.id}_{attempt}",
-            action_id=a.id,
-            worker_id=w.id,
-            display_text=a.description.upper(),
-            spoken_text=a.description,
-            expected_duration_seconds=a.timeout_seconds,
-        )
-        a.status = ActionStatus.dispatched.value
-        a.dispatched_at = utc_now()
-        w.status = WorkerStatus.assigned.value
-        w.current_action_id = a.id
-        asyncio.create_task(ws.send(w.id, "instruction_created", a.instruction.model_dump(mode="json")))
-
-
-def check_goal() -> None:
-    if not state.goal or not state.actions:
-        return
-    if all(a.status == ActionStatus.verified.value for a in state.actions):
-        state.goal.status = "completed"
-        state.execution_status = "completed"
-
-
-async def flush_broadcasts() -> None:
-    if state.consume_dirty():
-        await ws.broadcast("world_state_changed", state.world.model_dump(mode="json"))
-
-
-async def tick() -> None:
-    if state.execution_status in ("idle", "paused", "completed", "emergency"):
-        await flush_broadcasts()
-        return
-    drain_inbox()
-    verify_pending()
-    complete_actions()
-    unlock_dependents()
-    await detect_deviations()
-    await detect_timeouts()
-    await run_scheduler()
-    dispatch()
-    check_goal()
-    await flush_broadcasts()
+# ── main loop ───────────────────────────────────────────────────────────────
 
 
 async def run_forever() -> None:
-    interval = 1.0 / settings.tick_hz
+    interval = 1.0 / max(settings.tick_hz, 0.5)
     while True:
         t0 = time.perf_counter()
         try:
             await tick()
         except Exception:
+            # Not optional. A traceback here would be a dead demo; instead it is a shrug.
             log.exception("tick failed")
-            await state.emit("system_warning", "Internal exception contained. Coordination continuing.",
-                              severity="warn")
+            state.emit_soon(
+                "system_warning",
+                "Internal exception contained. Coordination continuing.",
+                severity="warn",
+            )
         await asyncio.sleep(max(0.0, interval - (time.perf_counter() - t0)))
+
+
+async def tick() -> None:
+    await drain_inbox_async()
+
+    if state.execution_status in ("idle", "paused", "emergency"):
+        if world_model.refresh(state):
+            ws.mark_world_dirty()
+        await flush_outbox()
+        await ws.flush()
+        return
+
+    if state.execution_status == "completed":
+        # Keep watching after the objective is met. A completed plan is a claim about the
+        # world, and the world can still change — an operator moving a verified item must
+        # reopen the objective rather than be silently ignored.
+        if world_model.refresh(state):
+            ws.mark_world_dirty()
+        handle_deviations()
+        if state.actions_with_status("queued", "available", "assigned", *DISPATCHABLE):
+            state.execution_status = "executing"
+            if state.goal:
+                state.goal.status = "executing"
+            state.emit_soon(
+                "goal_reopened",
+                "Objective reopened: the world no longer matches the verified state.",
+                severity="critical",
+            )
+        state.tick_metrics()
+        await flush_outbox()
+        await ws.flush()
+        return
+
+    if world_model.refresh(state):
+        ws.mark_world_dirty()
+
+    evaluate_verifications()
+    complete_actions()
+    unlock_dependents()
+    handle_deviations()
+    schedule_actions()
+    dispatch()
+    check_goal()
+
+    state.tick_metrics()
+    await flush_outbox()
+    await ws.flush()
+
+
+# ── 1. inbox ────────────────────────────────────────────────────────────────
+
+
+async def drain_inbox_async() -> None:
+    """Three workers tapping Completed at the same instant become three ORDERED inbox
+    entries, not three concurrent mutations. This is the race-condition answer.
+
+    Worker messages are synchronous handlers. Host commands may need to await (planning,
+    reasoning bursts), so they are dispatched here rather than inside the state machine.
+    """
+    from .host_commands import HOST_HANDLERS
+
+    while state.inbox:
+        msg = state.inbox.popleft()
+        try:
+            if msg.type in HOST_HANDLERS:
+                await HOST_HANDLERS[msg.type](msg.payload or {})
+                continue
+            handler = HANDLERS.get(msg.type)
+            if handler:
+                handler(msg.payload or {}, msg.worker_id)
+        except Exception:
+            log.exception("handler %s", msg.type)
+
+
+def drain_inbox() -> None:
+    """Synchronous variant for tests that only push worker messages."""
+    while state.inbox:
+        msg = state.inbox.popleft()
+        handler = HANDLERS.get(msg.type)
+        if handler:
+            try:
+                handler(msg.payload or {}, msg.worker_id)
+            except Exception:
+                log.exception("handler %s", msg.type)
+
+
+# ── 3-4. verification ───────────────────────────────────────────────────────
+
+
+def evaluate_verifications() -> None:
+    for a in state.actions_with_status("awaiting_verification", *DISPATCHABLE):
+        result = verifier.evaluate(a, state)
+        a.confidence = result.score
+        if result.verified and a.status in ("awaiting_verification", *DISPATCHABLE):
+            _mark_verified(a, result.summary)
+
+
+def _mark_verified(a: Action, summary: str) -> None:
+    attribution.note_verified(a, state)
+    a.status = "verified"
+    a.completed_at = now_iso()
+    state.free_locks_for(a.id)
+    w = state.worker(a.assigned_worker_id)
+    if w:
+        w.current_action_id = None
+        w.status = "ready" if w.connected and w.available else w.status
+    what = state.label_of(a.object_id) if a.object_id else a.description
+    where = f" at {state.zone_label(a.target_zone)}" if a.target_zone else ""
+    state.emit_soon(
+        "action_verified",
+        f"{what.capitalize()} confirmed{where}. {summary}.",
+        severity="success",
+        action_id=a.id,
+        confidence=a.confidence,
+    )
+    ws.mark_actions_dirty()
+    ws.mark_workers_dirty()
+
+
+def complete_actions() -> None:
+    """Anything verified must hold no locks and own no worker."""
+    for a in state.actions_with_status("verified", "cancelled"):
+        state.free_locks_for(a.id)
+
+
+# ── 5. dependency unlocking ─────────────────────────────────────────────────
+
+
+def unlock_dependents() -> None:
+    for a in state.actions.values():
+        if a.status != "queued":
+            continue
+        deps = [state.actions.get(d) for d in a.dependencies]
+        if all(d is not None and d.status == "verified" for d in deps):
+            a.status = "available"
+            ws.mark_actions_dirty()
+
+
+# ── 6-8. deviation + recovery ───────────────────────────────────────────────
+
+
+def handle_deviations() -> None:
+    triggers = recovery_engine.detect(state)
+    if not triggers:
+        return
+    for trigger in triggers[:2]:  # never storm the UI
+        plan = recovery_engine.plan_recovery(trigger, state)
+        _apply_recovery(plan)
+
+
+def _apply_recovery(plan: recovery_engine.RecoveryPlan) -> None:
+    t = plan.trigger
+    state.metrics.deviations += 1
+
+    state.emit_soon(
+        "deviation_detected",
+        t.message,
+        severity="critical",
+        kind=t.kind,
+        expected=t.expected,
+        observed=t.observed,
+        action_ids=t.action_ids,
+        object_id=t.object_id,
+    )
+
+    for aid in plan.cancel_action_ids:
+        a = state.actions.get(aid)
+        if a and not a.terminal:
+            a.status = "cancelled"
+            state.free_locks_for(aid)
+            _release_worker(a)
+
+    # Pause ONLY the dependency chain that depends on the affected resource.
+    # Everything else keeps running — this is the whole pitch.
+    for aid in plan.pause_action_ids:
+        a = state.actions.get(aid)
+        if a and a.status in ("available", "assigned", *DISPATCHABLE):
+            _cancel_instruction(a, "paused pending recovery")
+            a.status = "queued"
+            a.blocked_reason = "paused pending recovery"
+            state.free_locks_for(aid)
+            _release_worker(a)
+
+    for key in plan.release_locks:
+        state.locks.pop(key, None)
+
+    for wid in plan.free_workers:
+        w = state.worker(wid)
+        if w:
+            w.current_action_id = None
+            if w.status not in ("unavailable", "paused", "emergency", "disconnected"):
+                w.status = "ready"
+
+    for aid, wid in plan.reassign.items():
+        a = state.actions.get(aid)
+        if not a:
+            continue
+        if wid is None:
+            prev = a.assigned_worker_id
+            _cancel_instruction(a, "reassigning")
+            a.assigned_worker_id = None
+            a.status = "available" if not a.dependencies or _deps_met(a) else "queued"
+            a.retry_count += 1
+            _release_worker_id(prev)
+            if prev:
+                attribution.note_failure(prev, reassigned=True)
+                pw = state.worker(prev)
+                if pw and t.kind == "worker_timeout":
+                    pw.confidence = 0.6  # scheduler's risk penalty now avoids them
+                state.metrics.reassignments += 1
+        else:
+            a.status = "assigned"  # reissue to the same worker with higher urgency
+            a.retry_count += 1
+
+    for new in plan.insert_actions:
+        if new.id not in state.actions:
+            state.actions[new.id] = new
+            new.status = "available"
+            state.metrics.actions_total = len(state.actions)
+            state.emit_soon(
+                "recovery_action_created",
+                f"Recovery action created: {new.description}",
+                severity="warn",
+                action_id=new.id,
+            )
+
+    state.metrics.recoveries += 1
+    state.emit_soon("recovery_started", plan.narration, severity="warn", kind=t.kind)
+    ws.mark_actions_dirty()
+    ws.mark_workers_dirty()
+
+
+def _deps_met(a: Action) -> bool:
+    return all((d := state.actions.get(dep)) and d.status == "verified" for dep in a.dependencies)
+
+
+def _release_worker(a: Action) -> None:
+    _release_worker_id(a.assigned_worker_id)
+
+
+def _release_worker_id(wid: str | None) -> None:
+    w = state.worker(wid)
+    if w and w.current_action_id:
+        w.current_action_id = None
+        if w.status in ("assigned", "executing"):
+            w.status = "ready" if w.connected and w.available else "disconnected"
+
+
+def _cancel_instruction(a: Action, reason: str) -> None:
+    if a.instruction and a.assigned_worker_id:
+        _queue_send(
+            a.assigned_worker_id,
+            "instruction_cancelled",
+            {"instruction_id": a.instruction.id, "action_id": a.id, "reason": reason},
+        )
+    a.instruction = None
+
+
+# ── 9. scheduling ───────────────────────────────────────────────────────────
+
+
+def _apply_attribution(action: Action, chosen: Any, view: Any, claimed: set[str]) -> Any:
+    """Re-rank viable candidates using observed performance; explain any change."""
+    try:
+        cands = [c for c in scheduler.score_workers(action, view) if c.viable]
+    except Exception:
+        return chosen
+    if len(cands) < 2:
+        return chosen
+
+    ranked = []
+    for c in cands:
+        if c.worker_id in claimed and c.worker_id != chosen.worker_id:
+            continue
+        delta, reasons = attribution.adjust(c.worker_id, action)
+        ranked.append((c.score + delta, c, reasons))
+    if not ranked:
+        return chosen
+    ranked.sort(key=lambda r: r[0])
+    _, best, reasons = ranked[0]
+
+    if best.worker_id != chosen.worker_id and reasons:
+        # Say plainly that the change came from observed performance, and who lost out.
+        best.reason = (
+            f"{best.callsign} selected on record: {', '.join(reasons[:2])}. "
+            f"{chosen.callsign} scored better on position alone."
+        )
+    elif reasons:
+        best.reason = f"{best.reason.rstrip('.')}. Record: {reasons[0]}."
+    return best
+
+
+class _SchedulerView:
+    """List-shaped view of HiveState, matching scheduler.SchedulerState.
+
+    HiveState keys actions and workers by id because everything else looks them up that
+    way; the scheduler iterates. One tiny adapter beats changing either side.
+    """
+
+    __slots__ = ("_s",)
+
+    def __init__(self, s: Any) -> None:
+        self._s = s
+
+    @property
+    def actions(self) -> list:
+        return list(self._s.actions.values())
+
+    @property
+    def workers(self) -> list:
+        return list(self._s.workers.values())
+
+    @property
+    def scene(self):
+        return self._s.scene
+
+    @property
+    def locks(self) -> dict:
+        return self._s.locks
+
+    @property
+    def objects(self):
+        return self._s.scene.objects
+
+    @property
+    def zones(self):
+        return self._s.scene.zones
+
+    def worker_by_id(self, worker_id: str):
+        return self._s.workers.get(worker_id)
+
+    def action_by_id(self, action_id: str):
+        return self._s.actions.get(action_id)
+
+
+def schedule_actions() -> None:
+    view = _SchedulerView(state)
+    claimed: set[str] = set()
+    for action, assignment in scheduler.select_batch(view):
+        # The scheduler answers "who CAN do this" from capability, reachability and load.
+        # Attribution answers "who SHOULD" from what has actually happened this run. It
+        # only ever re-orders candidates the scheduler already judged viable.
+        assignment = _apply_attribution(action, assignment, view, claimed)
+        claimed.add(assignment.worker_id)
+        action.assigned_worker_id = assignment.worker_id
+        action.assignment_reason = assignment.reason
+        action.status = "assigned"
+        w = state.worker(assignment.worker_id)
+        if w:
+            w.assignment_count += 1
+        for key in action.lock_targets:
+            state.locks[key] = action.id
+        obj = state.scene.by_id(action.object_id) if action.object_id else None
+        if obj:
+            obj.locked_by = action.id
+        state.emit_soon(
+            "action_assigned",
+            assignment.reason,
+            severity="info",
+            action_id=action.id,
+            worker_id=assignment.worker_id,
+            factors=assignment.factors,
+        )
+        ws.mark_actions_dirty()
+
+
+# ── 10. dispatch ────────────────────────────────────────────────────────────
+
+
+def dispatch() -> None:
+    for a in state.actions_with_status("assigned"):
+        w = state.worker(a.assigned_worker_id)
+        if not w:
+            a.status = "available"
+            continue
+        a.attempt += 1
+        obj = state.scene.by_id(a.object_id) if a.object_id else None
+        a.origin_zone = obj.zone if obj else None
+        a.instruction = build_instruction(a, w)
+        a.status = "dispatched"
+        a.dispatched_at = now_iso()
+        w.status = "assigned"
+        w.current_action_id = a.id
+        _queue_send(w.id, "instruction_created", a.instruction.model_dump())
+        state.emit_soon(
+            "instruction_created",
+            f"{w.callsign}: {a.instruction.display_text}",
+            severity="info",
+            action_id=a.id,
+            worker_id=w.id,
+        )
+        ws.mark_actions_dirty()
+        ws.mark_workers_dirty()
+
+
+def _bare(label: str) -> str:
+    """Strip a leading article so "the {label}" never reads "the the scanner".
+
+    Roles come from the operator's own words ("the priority item"), which is right for
+    display but wrong once a template supplies its own article.
+    """
+    s = (label or "").strip()
+    for article in ("the ", "a ", "an "):
+        if s.lower().startswith(article):
+            return s[len(article):]
+    return s
+
+
+def build_instruction(a: Action, w: Any) -> Instruction:
+    """Instruction ids are unique per (action, attempt). That uniqueness is what makes
+    speak-once work on the phone: a re-render is silent, a genuine re-issue speaks."""
+    label = _bare(state.label_of(a.object_id)) if a.object_id else ""
+    zone = state.zone_label(a.target_zone) if a.target_zone else ""
+    urgency = "critical" if a.is_recovery or a.retry_count >= 2 else ("high" if a.retry_count else "normal")
+
+    if a.type in ("place_in_zone", "move_to_zone"):
+        display = f"MOVE THE {label.upper()} TO {zone.upper()}"
+        spoken = f"Move the {label} to {zone}."
+        detail = "Set it down inside the marked area, then step back."
+    elif a.type == "hold":
+        display = f"HOLD THE {label.upper()} STEADY"
+        spoken = f"Hold the {label} steady. Do not let it move."
+        detail = "Keep it still until told to release."
+    elif a.type == "release":
+        display = f"RELEASE THE {label.upper()}"
+        spoken = f"Release the {label} and move your hand back."
+        detail = "Step back from the workspace."
+    elif a.type == "pick_up":
+        display = f"PICK UP THE {label.upper()}"
+        spoken = f"Pick up the {label}."
+        detail = "Hold it and wait for the next instruction."
+    elif a.type == "inspect":
+        display = f"CHECK {zone.upper()}" if zone else "CHECK THE AREA"
+        spoken = f"Check that {zone} is correct, then confirm." if zone else "Check the area, then confirm."
+        detail = "Confirm when everything is in place."
+    else:
+        display = a.description.upper()
+        spoken = a.description
+        detail = ""
+
+    if a.retry_count:
+        spoken = f"{w.callsign}. {spoken}"
+
+    return Instruction(
+        id=f"instr_{a.id}_{a.attempt}",
+        action_id=a.id,
+        worker_id=w.id,
+        display_text=display,
+        spoken_text=spoken,
+        detail_text=detail,
+        urgency=urgency,  # type: ignore[arg-type]
+        expected_duration_seconds=max(6, a.timeout_seconds - 6),
+        requires_verification=True,
+        correction_text=("Correction. " + spoken) if a.is_recovery else None,
+    )
+
+
+_outbox: list[tuple[str, str, Any]] = []
+
+
+def _queue_send(worker_id: str, type: str, payload: Any) -> None:
+    _outbox.append((worker_id, type, payload))
+
+
+async def flush_outbox() -> None:
+    global _outbox
+    pending, _outbox = _outbox, []
+    for wid, type, payload in pending:
+        await ws.send(wid, type, payload)
+
+
+# ── 11. goal completion ─────────────────────────────────────────────────────
+
+
+def check_goal() -> None:
+    if not state.goal or state.goal.status == "completed":
+        return
+    if not state.actions:
+        return
+    if any(a.status not in ("verified", "cancelled") for a in state.actions.values()):
+        return
+
+    state.goal.status = "completed"
+    state.execution_status = "completed"
+    state.metrics.completed_at = now_iso()
+    m = state.metrics
+    lex = state.scenario.lexicon.get("complete", "OBJECTIVE COMPLETE")
+    state.emit_soon(
+        "goal_completed",
+        f"{lex}. {m.actions_verified} actions verified · {m.parallel_peak} peak parallel · "
+        f"{m.recoveries} recovery · {m.reassignments} reassignment · "
+        f"{int(m.avg_confidence * 100)}% mean confidence.",
+        severity="success",
+        report=m.model_dump(),
+        contributions=attribution.leaderboard(state),
+    )
+    note = attribution.after_action(state)
+    if note:
+        state.emit_soon("after_action", note, severity="info")
+    ws.mark_actions_dirty()
+
+
+# ── inbox handlers ──────────────────────────────────────────────────────────
+
+
+def on_worker_acknowledged(p: dict, wid: str | None) -> None:
+    a = state.actions.get(p.get("action_id", ""))
+    if a and a.assigned_worker_id == wid and a.status == "dispatched":
+        a.status = "acknowledged"
+        w = state.worker(wid)
+        if w:
+            w.status = "executing"
+        ws.mark_actions_dirty()
+
+
+def on_worker_completed(p: dict, wid: str | None) -> None:
+    a = state.actions.get(p.get("action_id", ""))
+    if not a:
+        return
+    if a.status in ("verified", "cancelled", "failed"):
+        return  # already resolved
+    if a.assigned_worker_id != wid:
+        return  # not yours
+    if any(e.kind == "worker_report" for e in a.evidence):
+        return  # already counted — double tap, or a retry after a socket blip
+    attribution.note_claim(wid)
+    a.evidence.append(
+        Evidence(kind="worker_report", confidence=float(p.get("confidence") or 1.0), detail="worker reported done")
+    )
+    a.status = "awaiting_verification"
+    state.emit_soon(
+        "worker_reported",
+        f"{state.callsign(wid)} reported completion. Verifying against the world state.",
+        severity="info",
+        actor=wid or "hive",
+        action_id=a.id,
+    )
+    ws.mark_actions_dirty()
+
+
+def on_worker_blocked(p: dict, wid: str | None) -> None:
+    a = state.actions.get(p.get("action_id", "")) or _current_action(wid)
+    if a and a.assigned_worker_id == wid:
+        a.status = "blocked"
+        a.blocked_reason = p.get("reason") or "worker cannot complete"
+        ws.mark_actions_dirty()
+
+
+def on_worker_help(p: dict, wid: str | None) -> None:
+    state.emit_soon(
+        "worker_help",
+        f"{state.callsign(wid)} requested assistance.",
+        severity="warn",
+        actor=wid or "hive",
+        note=p.get("note"),
+    )
+
+
+def on_worker_pause(p: dict, wid: str | None) -> None:
+    w = state.worker(wid)
+    if w:
+        w.status = "paused"
+        w.available = False
+        ws.mark_workers_dirty()
+        state.emit_soon(f"worker_paused", f"{w.callsign} paused themselves.", severity="warn", actor=w.id)
+
+
+def on_worker_resume(p: dict, wid: str | None) -> None:
+    w = state.worker(wid)
+    if w:
+        w.status = "ready"
+        w.available = True
+        ws.mark_workers_dirty()
+        state.emit_soon("worker_resumed", f"{w.callsign} back online.", severity="success", actor=w.id)
+
+
+def on_worker_emergency(p: dict, wid: str | None) -> None:
+    state.execution_status = "emergency"
+    for a in state.actions.values():
+        if a.status in ("assigned", *DISPATCHABLE):
+            _cancel_instruction(a, "emergency stop")
+            a.status = "queued"
+    state.emit_soon(
+        "emergency_stop",
+        f"EMERGENCY STOP triggered by {state.callsign(wid)}. All activity halted.",
+        severity="critical",
+        actor=wid or "host",
+    )
+    ws.mark_actions_dirty()
+
+
+def on_worker_heartbeat(p: dict, wid: str | None) -> None:
+    w = state.worker(wid)
+    if w:
+        w.last_seen_at = now_iso()
+
+
+def on_worker_ready(p: dict, wid: str | None) -> None:
+    w = state.worker(wid)
+    if w:
+        w.status = "ready"
+        w.available = True
+        ws.mark_workers_dirty()
+
+
+def _current_action(wid: str | None) -> Action | None:
+    w = state.worker(wid)
+    return state.actions.get(w.current_action_id) if w and w.current_action_id else None
+
+
+HANDLERS: dict[str, Any] = {
+    "worker_ready": on_worker_ready,
+    "worker_acknowledged": on_worker_acknowledged,
+    "worker_completed": on_worker_completed,
+    "worker_blocked": on_worker_blocked,
+    "worker_help": on_worker_help,
+    "worker_pause": on_worker_pause,
+    "worker_resume": on_worker_resume,
+    "worker_emergency": on_worker_emergency,
+    "worker_heartbeat": on_worker_heartbeat,
+}

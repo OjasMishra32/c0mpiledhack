@@ -1,31 +1,18 @@
-"""Weighted evidence verification. Pure functions — mutates nothing except reading
-`state.evidence` (Action has no `evidence` field in the shared model, so worker
-reports / host overrides accumulate there, keyed by action id — see state.py).
-The orchestrator tick calls evaluate() and applies the result. See docs/CONTRACTS.md
-§2 and Nikki.md §3.
+"""Confidence-weighted verification.
 
-Weights and the 0.70 threshold live in app.config / app.models.EVIDENCE_WEIGHTS.
-Do not redefine them locally."""
+OWNER: Nikki. Working implementation — extend in place.
+
+Pure functions. Mutates nothing. The orchestrator applies the result.
+Weights and the threshold live in models.EVIDENCE_WEIGHTS / settings — never redefined here.
+"""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
+from typing import Any
 
-from app.config import settings
-from app.models import (
-    Action,
-    ActionStatus,
-    Evidence,
-    EVIDENCE_WEIGHTS,
-    EvidenceKind,
-    ObservedObject,
-    Predicate,
-    PredicateType,
-    WorkerStatus,
-)
-
-DEFAULT_NEAR_TOLERANCE = 0.12
+from .config import settings
+from .models import EVIDENCE_WEIGHTS, Action, Evidence, Predicate
 
 
 @dataclass
@@ -34,109 +21,179 @@ class VerificationResult:
     verified: bool
     evidence: list[Evidence] = field(default_factory=list)
     summary: str = ""
+    failed: list[str] = field(default_factory=list)
 
 
-def _find_object(state, object_id: str | None) -> ObservedObject | None:
-    if not object_id:
-        return None
-    return state.scene.by_id(object_id)
+def check_predicate(pred: Predicate, state: Any) -> tuple[bool, Evidence | None]:
+    """Returns (holds, evidence). Evidence is None when nothing observed it."""
+    scene = state.scene
+    sim = state.world.mode == "simulation" or not state.world.camera_online
 
+    if pred.type == "object_in_zone":
+        obj = scene.by_id(pred.subject)
+        if not obj:
+            return False, None
+        holds = obj.zone == pred.object
+        if not holds:
+            return False, None
+        kind = "simulation" if sim else "vision"
+        return True, Evidence(
+            kind=kind,  # type: ignore[arg-type]
+            confidence=obj.confidence,
+            detail=f"{obj.display_label()} observed in {state.zone_label(pred.object)}",
+        )
 
-def _evidence(kind: str, confidence: float, detail: str) -> Evidence:
-    return Evidence(kind=kind, confidence=confidence, weight=EVIDENCE_WEIGHTS[kind], detail=detail)
-
-
-def check_predicate(pred: Predicate, state) -> Evidence | None:
-    if pred.type == PredicateType.object_in_zone.value:
-        obj = _find_object(state, pred.subject)
-        if obj and obj.zone == pred.object:
-            kind = EvidenceKind.simulation.value if obj.source == "simulation" else EvidenceKind.vision.value
-            return _evidence(kind, obj.confidence, f"{obj.id} centroid inside {pred.object} bounds")
-        return None
-
-    if pred.type == PredicateType.object_near_object.value:
-        a, b = _find_object(state, pred.subject), _find_object(state, pred.object)
+    if pred.type == "object_near_object":
+        a, b = scene.by_id(pred.subject), scene.by_id(pred.object or "")
         if not a or not b:
-            return None
-        tolerance = pred.tolerance or DEFAULT_NEAR_TOLERANCE
-        dist = math.hypot(a.position.x - b.position.x, a.position.y - b.position.y)
-        if dist < tolerance:
-            return _evidence(EvidenceKind.vision.value, min(a.confidence, b.confidence), f"{a.id} near {b.id}")
-        return None
+            return False, None
+        if a.position.dist(b.position) > (pred.tolerance or 0.12):
+            return False, None
+        return True, Evidence(
+            kind="simulation" if sim else "vision",  # type: ignore[arg-type]
+            confidence=min(a.confidence, b.confidence),
+            detail=f"{a.display_label()} adjacent to {b.display_label()}",
+        )
 
-    if pred.type == PredicateType.object_stacked_on.value:
-        obj = _find_object(state, pred.subject)
-        if obj and obj.stacked_on == pred.object:
-            return _evidence(EvidenceKind.vlm.value, 0.85, f"{obj.id} reported on top of {pred.object}")
-        return None
+    if pred.type == "object_stacked_on":
+        a = scene.by_id(pred.subject)
+        if not a:
+            return False, None
+        if a.stacked_on == pred.object:
+            # Primary source is the VLM; it reports relations CV can only approximate.
+            kind = "vlm" if a.source == "vlm" else ("simulation" if sim else "inference")
+            return True, Evidence(
+                kind=kind,  # type: ignore[arg-type]
+                confidence=a.confidence,
+                detail=f"{a.display_label()} on {state.label_of(pred.object)}",
+            )
+        return False, None
 
-    if pred.type == PredicateType.object_held_by.value:
-        obj = _find_object(state, pred.subject)
-        if obj and obj.held_by == pred.object:
-            return _evidence(EvidenceKind.vlm.value, 0.85, f"{obj.id} reported held by {pred.object}")
-        return None
+    if pred.type == "object_held_by":
+        a = scene.by_id(pred.subject)
+        if a and a.held_by == pred.object:
+            return True, Evidence(kind="vlm", confidence=0.9, detail=f"{a.display_label()} held")
+        return False, None
 
-    if pred.type in (PredicateType.worker_ready.value, PredicateType.worker_idle.value):
-        w = state.worker_by_id(pred.subject)
-        if w and w.status == WorkerStatus.ready.value:
-            return _evidence(EvidenceKind.inference.value, 1.0, f"{w.callsign} ready")
-        return None
+    if pred.type == "object_visible":
+        a = scene.by_id(pred.subject)
+        if a and a.visible and a.confidence > 0.4:
+            return True, Evidence(
+                kind="simulation" if sim else "vision", confidence=a.confidence, detail="visible"  # type: ignore[arg-type]
+            )
+        return False, None
 
-    if pred.type == PredicateType.object_visible.value:
-        obj = _find_object(state, pred.subject)
-        if obj and obj.visible and obj.confidence > 0.4:
-            return _evidence(EvidenceKind.vision.value, obj.confidence, f"{obj.id} visible")
-        return None
+    if pred.type == "all_objects_in_zone":
+        # Two encodings are in use and both are legitimate:
+        #   subject = "obj_1|obj_2"  → those specific objects
+        #   subject = "<zone_id>"    → every object the plan routes to that zone
+        # See docs/CONTRACTS.md §2. Accepting both keeps planner and verifier decoupled.
+        zone_id = pred.object or pred.subject
+        ids = [i for i in (pred.subject or "").split("|") if i and scene.by_id(i)]
+        if not ids:
+            ids = sorted({
+                a.object_id
+                for a in state.actions.values()
+                if a.object_id and a.target_zone == zone_id
+            })
+        objs = [scene.by_id(i) for i in ids]
+        if not objs or any(o is None or o.zone != zone_id for o in objs):
+            return False, None
+        return True, Evidence(
+            kind="simulation" if sim else "vision",  # type: ignore[arg-type]
+            confidence=min(o.confidence for o in objs if o),
+            detail=f"{len(objs)} items in {state.zone_label(zone_id)}",
+        )
 
-    if pred.type == PredicateType.all_objects_in_zone.value:
-        ids = [i for i in (pred.subject or "").split(",") if i]
-        objs = [_find_object(state, i) for i in ids]
-        if objs and all(o and o.zone == pred.object for o in objs):
-            return _evidence(EvidenceKind.vision.value, min(o.confidence for o in objs), "all objects in zone")
-        return None
+    if pred.type == "sequence_completed":
+        # subject = "a1|a2" (specific actions) or a sentinel like "objective", which means
+        # "every other action in the plan". Both appear in practice.
+        ids = [i for i in (pred.subject or "").split("|") if i in state.actions]
+        if not ids:
+            ids = [
+                a.id
+                for a in state.actions.values()
+                if a.id != getattr(_current_action_id, "value", None)
+            ]
+        if ids and all(state.actions[i].status in ("verified", "cancelled") for i in ids):
+            return True, Evidence(kind="system", confidence=1.0, detail="all prerequisites verified")
+        return False, None
 
-    if pred.type == PredicateType.sequence_completed.value:
-        ids = [i for i in (pred.subject or "").split(",") if i]
-        actions = [state.action_by_id(i) for i in ids]
-        if actions and all(a and a.status == ActionStatus.verified.value for a in actions):
-            return _evidence(EvidenceKind.inference.value, 1.0, "dependency sequence verified")
-        return None
+    if pred.type in ("worker_ready", "worker_idle"):
+        w = state.workers.get(pred.subject)
+        if not w:
+            return False, None
+        ok = w.connected and w.available and (pred.type == "worker_ready" or not w.current_action_id)
+        return (True, Evidence(kind="system", confidence=1.0, detail="worker state")) if ok else (False, None)
 
-    # worker_acknowledged and manually_verified are appended directly to
-    # state.evidence[action.id] by the message handlers — nothing to check here.
-    return None
+    if pred.type in ("worker_acknowledged", "manually_verified"):
+        return False, None  # satisfied only by explicit evidence already on the action
+
+    return False, None
+
+
+class _Ctx:
+    value: str | None = None
+
+
+_current_action_id = _Ctx()
+
+
+def evaluate(action: Action, state: Any) -> VerificationResult:
+    _current_action_id.value = action.id
+    evidence: list[Evidence] = list(action.evidence)
+    failed: list[str] = []
+
+    for pred in action.expected_predicates:
+        holds, ev = check_predicate(pred, state)
+        if holds and ev:
+            evidence.append(ev)
+        elif not holds:
+            failed.append(_describe_predicate(pred, state))
+
+    score = min(1.0, sum(e.confidence * EVIDENCE_WEIGHTS.get(e.kind, e.weight) for e in evidence))
+    # An action with unsatisfied physical predicates is never verified on a worker's word
+    # alone — unless an operator explicitly overrode it.
+    overridden = any(e.kind == "host_override" for e in evidence)
+    verified = (score >= settings.verification_threshold) and (not failed or overridden)
+
+    return VerificationResult(
+        score=round(score, 2),
+        verified=verified,
+        evidence=evidence,
+        summary=narrate(evidence, score),
+        failed=failed,
+    )
+
+
+def _describe_predicate(p: Predicate, state: Any) -> str:
+    if p.type == "object_in_zone":
+        return f"{state.label_of(p.subject)} in {state.zone_label(p.object)}"
+    if p.type == "object_stacked_on":
+        return f"{state.label_of(p.subject)} on {state.label_of(p.object)}"
+    return f"{p.type}({p.subject})"
 
 
 def narrate(evidence: list[Evidence], score: float) -> str:
+    parts: list[str] = []
+
     def first(kind: str) -> Evidence | None:
         return next((e for e in evidence if e.kind == kind), None)
 
-    parts: list[str] = []
-    if v := first(EvidenceKind.vision.value):
+    if v := first("vision"):
         parts.append(f"tracker {int(v.confidence * 100)}%")
-    if m := first(EvidenceKind.vlm.value):
+    if m := first("vlm"):
         parts.append(f"scene model {int(m.confidence * 100)}%")
-    if first(EvidenceKind.worker_report.value):
-        parts.append("worker confirmed")
-    if first(EvidenceKind.host_override.value):
-        parts.append("operator confirmed")
-    if first(EvidenceKind.simulation.value):
+    if first("simulation"):
         parts.append("simulated state")
-    prefix = " + ".join(parts) if parts else "no evidence"
-    return f"{prefix} → {int(score * 100)}% confidence"
-
-
-def evaluate(action: Action, state) -> VerificationResult:
-    evidence = list(state.evidence.get(action.id, []))
-    for pred in action.expected_predicates:
-        ev = check_predicate(pred, state)
-        if ev:
-            evidence.append(ev)
-    score = min(1.0, sum(e.confidence * e.weight for e in evidence))
-    score = round(score, 2)
-    return VerificationResult(
-        score=score,
-        verified=score >= settings.verification_threshold,
-        evidence=evidence,
-        summary=narrate(evidence, score),
-    )
+    if first("worker_report"):
+        parts.append("worker confirmed")
+    if first("host_override"):
+        parts.append("operator confirmed")
+    if first("system"):
+        parts.append("prerequisites verified")
+    if first("inference"):
+        parts.append("inferred")
+    if not parts:
+        return "no evidence yet"
+    return f"{' + '.join(parts)} → {int(score * 100)}% confidence"

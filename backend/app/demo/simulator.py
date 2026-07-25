@@ -79,9 +79,30 @@ class Simulator:
         return objects
 
     def _distinct_hue(self, used: list[int], min_gap: int = 25) -> int:
-        for _ in range(20):
+        """Pick a hue that is distinct in NAME, not just in degrees.
+
+        Hue distance alone is not enough: "indigo" and "magenta" are far apart numerically
+        but normalize to adjacent colour words, so an objective saying "the indigo item"
+        would be genuinely ambiguous. A well-set-up table has objects a person can name
+        unambiguously, and a simulated scene should be no different.
+        """
+        from app.planner.grounding import COLOR_SYNONYMS
+
+        def canonical(h: int) -> str:
+            name = name_hue(h, 200, 200)
+            return COLOR_SYNONYMS.get(name, name)
+
+        taken = {canonical(u) for u in used}
+        for _ in range(60):
             h = random.randint(0, 179)
+            if canonical(h) in taken:
+                continue
             if all(min(abs(h - u), 180 - abs(h - u)) >= min_gap for u in used):
+                return h
+        # Fall back to any hue with an unused name before giving up entirely.
+        for _ in range(60):
+            h = random.randint(0, 179)
+            if canonical(h) not in taken:
                 return h
         return random.randint(0, 179)
 

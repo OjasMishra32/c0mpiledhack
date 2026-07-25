@@ -40,6 +40,7 @@ HUE_NAMES: dict[str, tuple[tuple[int, int], ...]] = {
 }
 
 COLOR_SYNONYMS: dict[str, str] = {
+    "indigo": "purple",  # the vision namer emits this at hue ~135
     "crimson": "red",
     "scarlet": "red",
     "maroon": "red",
@@ -331,7 +332,11 @@ def _tokens(text: str) -> list[str]:
 
 
 def _label_tokens(label: str) -> list[str]:
-    return [t for t in _tokens(label) if t not in {"the", "of", "a", "an"}]
+    toks = _tokens(label)
+    articles = {"the", "of", "a", "an"}
+    while toks and toks[0] in articles:
+        toks.pop(0)  # leading article only — a trailing "A" is an identifier ("Pick Aisle A")
+    return [t for i, t in enumerate(toks) if t not in articles or i == len(toks) - 1]
 
 
 # ── result types ───────────────────────────────────────────────────────────────
@@ -519,8 +524,13 @@ def _score(phrase: str, obj: ObservedObject, scene: Scene) -> tuple[float, list[
     # colour — 0.40
     want = _phrase_colors(toks)
     if want:
-        have = obj.descriptor.color_name
-        if have in want:
+        # Normalize BOTH sides through the synonym map. The vision namer emits names like
+        # "teal" and "lime" that this vocabulary treats as synonyms of cyan and green — so
+        # without this, HIVE would print "teal item" on screen and then fail to understand
+        # an operator saying "the teal item".
+        raw = obj.descriptor.color_name
+        have = COLOR_SYNONYMS.get(raw, raw)
+        if have in want or raw in want:
             score += 0.40
             basis.append("colour match")
         elif want & COLOR_ADJACENCY.get(have, set()):
@@ -680,13 +690,16 @@ def _extract_place_phrases(goal_text: str, scene: Scene) -> tuple[list[ZoneBindi
     zone_bindings: list[ZoneBinding] = []
     unbound: list[str] = []
     spans: list[tuple[int, int]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, int]] = set()
 
     def consider(raw: str, span: tuple[int, int]) -> None:
         phrase = _trim_body(raw).strip()
-        if not phrase or phrase.lower() in seen:
+        if not phrase:
             return
-        seen.add(phrase.lower())
+        key = (phrase.lower(), span[0])
+        if key in seen:
+            return
+        seen.add(key)
         span = (span[0], span[0] + len(phrase))  # only the place itself, not what follows it
         zone_id, conf, basis = _match_zone(phrase, scene)
         if zone_id:
@@ -708,7 +721,7 @@ def _extract_place_phrases(goal_text: str, scene: Scene) -> tuple[list[ZoneBindi
         for m in re.finditer(pattern, goal_text, re.IGNORECASE):
             if any(s[0] <= m.start() < s[1] for s in spans):
                 continue
-            if z.id not in {zb.zone_id for zb in zone_bindings}:
+            if not any(zb.span == m.span() for zb in zone_bindings):
                 zone_bindings.append(
                     ZoneBinding(phrase=m.group(0), zone_id=z.id, confidence=0.95,
                                 basis=f"matched zone label “{z.label}”", span=m.span())

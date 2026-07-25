@@ -111,6 +111,19 @@ BINDINGS_TOOL = {
 def _client():
     from openai import AsyncOpenAI  # imported lazily so a keyless run never touches it
 
+    # Draw from the shared pool so this and perception never double-spend one key's budget.
+    try:
+        from ..key_pool import get_pool
+
+        pool = get_pool(settings.nim_keys, settings.nim_per_key_rpm, settings.nim_key_strategy)
+        if pool and pool.count:
+            import random
+
+            key = pool.keys[random.randrange(pool.count)]
+            return AsyncOpenAI(base_url=settings.nim_base_url, api_key=key)
+    except Exception:
+        pass
+
     return AsyncOpenAI(base_url=settings.nim_base_url, api_key=settings.nvidia_api_key)
 
 

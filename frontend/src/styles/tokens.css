@@ -1,0 +1,59 @@
+:root {
+  /* surfaces */
+  --background: #0b0b0c;
+  --surface-primary: #141416;
+  --surface-secondary: #1c1c1e;
+  --surface-elevated: #242426;
+
+  /* text */
+  --text-primary: #f5f5f7;
+  --text-secondary: #a1a1a6;
+  --text-tertiary: #6e6e73;
+
+  /* separators */
+  --separator: rgba(255, 255, 255, 0.08);
+  --separator-strong: rgba(255, 255, 255, 0.14);
+
+  /* semantic — used sparingly and only for their meaning */
+  --hive-accent: #f2c94c;
+  --hive-accent-ink: #1a1a1a; /* text on filled accent */
+  --success: #30d158;
+  --warning: #ff9f0a;
+  --failure: #ff453a;
+  --information: #0a84ff;
+
+  /* worker identity — a single dot/line only, never a themed surface */
+  --w-a: #5AC8FA; --w-b: #5E5CE6; --w-c: #30D158; --w-d: #FF9F0A; --w-e: #FF375F;
+
+  --r-control: 8px;
+  --r-surface: 16px;
+  --ease-standard: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--background);
+  color: var(--text-primary);
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text',
+    'Helvetica Neue', Arial, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.font-technical {
+  font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+}
+
+:focus-visible {
+  outline: 2px solid var(--information);
+  outline-offset: 2px;
+}

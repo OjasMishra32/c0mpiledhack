@@ -1,29 +1,33 @@
-"""One socket, two roles. See docs/CONTRACTS.md §3 and Ojas.md §5.
+"""WebSocket transport.
 
-Workers receive ONLY their own `instruction_created` message — never the goal text,
-the action list, or another worker's instruction. That is the entire "private
-instructions" premise of the product; enforce it here on the server side.
-
-`Worker.session_token` is declared `exclude=True` in models.py, so a plain
-`.model_dump()` already never leaks it outward — no separate "public" serializer
-needed."""
+Two hard guarantees:
+  1. A worker socket NEVER receives the plan, the goal, or another worker's instruction.
+     If a judge opens devtools on a phone, all they may see is one instruction.
+  2. A refresh reclaims the same slot via a localStorage token. Five slots exist from boot;
+     workers are CLAIMED, never created.
+"""
 
 from __future__ import annotations
 
+import logging
 from contextlib import suppress
+from typing import Any
 from uuid import uuid4
 
 from fastapi import WebSocket
 
-from app.models import WorkerStatus, utc_now
+from .models import Envelope, Worker, now_iso
+from .state import state
+
+log = logging.getLogger("hive.ws")
 
 
 class SlotsFull(Exception):
     pass
 
 
-def envelope(type: str, payload: dict, seq: int = 0) -> dict:
-    return {"type": type, "payload": payload, "ts": utc_now().isoformat(), "seq": seq}
+def envelope(type: str, payload: Any, seq: int = 0) -> dict[str, Any]:
+    return Envelope(type=type, payload=payload, ts=now_iso(), seq=seq).model_dump()
 
 
 class WSManager:
@@ -31,101 +35,181 @@ class WSManager:
         self.host_sockets: set[WebSocket] = set()
         self.worker_sockets: dict[str, WebSocket] = {}
         self.token_map: dict[str, str] = {}
+        self._world_dirty = False
+        self._workers_dirty = False
+        self._actions_dirty = False
+
+    # ── dirty flags: the tick coalesces broadcasts, nothing pushes per-change ──
+
+    def mark_world_dirty(self) -> None:
+        self._world_dirty = True
+
+    def mark_workers_dirty(self) -> None:
+        self._workers_dirty = True
+
+    def mark_actions_dirty(self) -> None:
+        self._actions_dirty = True
+
+    async def flush(self) -> None:
+        if self._world_dirty:
+            self._world_dirty = False
+            await self.broadcast_host(
+                "world_state_changed",
+                {"world": state.world.model_dump(), "scene": state.scene.model_dump()},
+            )
+        if self._workers_dirty:
+            self._workers_dirty = False
+            await self.broadcast_host("workers_changed", [w.public_dict() for w in state.workers.values()])
+        if self._actions_dirty:
+            self._actions_dirty = False
+            await self.broadcast_host(
+                "actions_changed",
+                {
+                    "actions": [a.model_dump() for a in state.actions.values()],
+                    "locks": state.locks,
+                    "metrics": state.metrics.model_dump(),
+                    "execution_status": state.execution_status,
+                },
+            )
+        for ev in state.drain_pending_events():
+            await self.broadcast("event", ev.model_dump())
+
+    # ── connect ─────────────────────────────────────────────────────────────
 
     async def connect_host(self, sock: WebSocket) -> None:
         self.host_sockets.add(sock)
+        log.info("host connected (%d total)", len(self.host_sockets))
 
-    async def connect_worker(self, sock: WebSocket, token: str | None):
-        from app.state import state
+    async def connect_worker(self, sock: WebSocket, token: str | None) -> Worker:
+        # 1. Known token → same slot back. Refresh-safe.
+        wid = self.token_map.get(token) if token else None
 
-        if token and token in self.token_map:
-            wid = self.token_map[token]
-        else:
+        if wid is None:
+            # 2. First free slot: prefer never-claimed, then merely disconnected.
             wid = next(
-                (w.id for w in state.workers if not w.connected and w.session_token is None),
+                (w.id for w in state.workers.values() if not w.connected and w.session_token is None),
                 None,
-            ) or next((w.id for w in state.workers if not w.connected), None)
+            ) or next((w.id for w in state.workers.values() if not w.connected), None)
             if wid is None:
-                await sock.send_json(envelope("error_event", {
-                    "code": "hive_full",
-                    "message": "All five responder slots are occupied.",
-                }))
-                await sock.close()
+                await sock.send_json(
+                    envelope(
+                        "error_event",
+                        {"code": "hive_full", "message": "All five worker slots are occupied."},
+                    )
+                )
                 raise SlotsFull()
             token = token or str(uuid4())
             self.token_map[token] = wid
 
-        worker = state.worker_by_id(wid)
-        if wid in self.worker_sockets:
+        worker = state.workers[wid]
+
+        # 3. Evict a stale socket on this slot (phone reconnected before the old one timed out).
+        if wid in self.worker_sockets and self.worker_sockets[wid] is not sock:
             with suppress(Exception):
                 await self.worker_sockets[wid].close()
+
         self.worker_sockets[wid] = sock
         worker.connected = True
         worker.session_token = token
-        if worker.status in (WorkerStatus.disconnected.value, WorkerStatus.joining.value):
-            worker.status = WorkerStatus.ready.value
+        worker.last_seen_at = now_iso()
+        if worker.status in ("disconnected", "joining"):
+            worker.status = "ready"
 
-        await self.send(wid, "worker_assigned", {"identity": worker.model_dump(mode="json"), "token": token})
-        await self.broadcast_host("workers_changed", [w.model_dump(mode="json") for w in state.workers])
+        await self.send(wid, "worker_assigned", {"identity": worker.public_dict(), "token": token})
+        self.mark_workers_dirty()
+        await state.emit(
+            "worker_joined",
+            f"{worker.callsign} online — {worker.role}.",
+            severity="success",
+            actor=wid,
+            worker_id=wid,
+        )
 
+        # 4. Re-deliver a live instruction so a refresh mid-action doesn't strand them.
         if worker.current_action_id:
-            a = state.action_by_id(worker.current_action_id)
+            a = state.actions.get(worker.current_action_id)
             if a and a.instruction:
-                await self.send(wid, "instruction_created", a.instruction.model_dump(mode="json"))
+                await self.send(wid, "instruction_created", a.instruction.model_dump())
         return worker
 
     async def disconnect(self, sock: WebSocket) -> None:
-        from app.state import state
-
         self.host_sockets.discard(sock)
         for wid, s in list(self.worker_sockets.items()):
             if s is sock:
-                del self.worker_sockets[wid]
-                worker = state.worker_by_id(wid)
-                if worker:
-                    worker.connected = False
-                    worker.last_seen_at = utc_now()
+                self.worker_sockets.pop(wid, None)
+                w = state.workers.get(wid)
+                if w:
+                    # Do NOT mark unavailable here — Wi-Fi blips constantly. The tick decides
+                    # after a grace period whether to reassign.
+                    w.connected = False
+                    w.last_seen_at = now_iso()
+                    if w.status not in ("unavailable", "emergency"):
+                        w.status = "disconnected"
+                    self.mark_workers_dirty()
+                    await state.emit(
+                        "worker_disconnected",
+                        f"{w.callsign} link lost. Holding assignment briefly before reassignment.",
+                        severity="warn",
+                        actor=wid,
+                        worker_id=wid,
+                    )
+                break
 
-    async def send(self, worker_id: str, type: str, payload: dict) -> None:
+    # ── send ────────────────────────────────────────────────────────────────
+
+    async def send(self, worker_id: str, type: str, payload: Any) -> None:
+        """Send to exactly ONE worker."""
         sock = self.worker_sockets.get(worker_id)
         if not sock:
             return
-        with suppress(Exception):
+        try:
             await sock.send_json(envelope(type, payload))
+        except Exception:
+            log.debug("send to %s failed", worker_id)
 
-    async def broadcast(self, type: str, payload: dict) -> None:
-        for sock in list(self.host_sockets) + list(self.worker_sockets.values()):
-            with suppress(Exception):
-                await sock.send_json(envelope(type, payload))
-
-    async def broadcast_host(self, type: str, payload: dict) -> None:
+    async def broadcast_host(self, type: str, payload: Any) -> None:
+        dead = []
+        msg = envelope(type, payload)
         for sock in list(self.host_sockets):
-            with suppress(Exception):
-                await sock.send_json(envelope(type, payload))
+            try:
+                await sock.send_json(msg)
+            except Exception:
+                dead.append(sock)
+        for s in dead:
+            self.host_sockets.discard(s)
 
-    def _snapshot(self) -> dict:
-        from app.state import state
+    async def broadcast(self, type: str, payload: Any) -> None:
+        """Host + all workers. Only for events safe for every audience."""
+        await self.broadcast_host(type, payload)
+        msg = envelope(type, payload)
+        for wid, sock in list(self.worker_sockets.items()):
+            try:
+                await sock.send_json(msg)
+            except Exception:
+                self.worker_sockets.pop(wid, None)
 
-        return {
-            "mode": state.world.mode,
-            "goal": state.goal.model_dump(mode="json") if state.goal else None,
-            "actions": [a.model_dump(mode="json") for a in state.actions],
-            "workers": [w.model_dump(mode="json") for w in state.workers],
-            "world": state.world.model_dump(mode="json"),
-            "scene": state.scene.model_dump(mode="json"),
-            "execution_status": state.execution_status,
-            "events": [e.model_dump(mode="json") for e in state.events[-200:]],
-        }
+    async def send_snapshot(self, sock: WebSocket, role: str, worker_id: str | None = None) -> None:
+        if role == "worker":
+            w = state.workers.get(worker_id or "")
+            action = state.actions.get(w.current_action_id) if w and w.current_action_id else None
+            payload = {
+                "identity": w.public_dict() if w else None,
+                "execution_status": state.execution_status,
+                "comms_profile": state.scenario.comms_profile,
+                "lexicon": state.scenario.lexicon,
+                "instruction": action.instruction.model_dump() if action and action.instruction else None,
+                "action_status": action.status if action else None,
+            }
+        else:
+            payload = state.snapshot()
+        with suppress(Exception):
+            await sock.send_json(envelope("state_snapshot", payload))
 
     async def broadcast_snapshot(self) -> None:
-        snapshot = self._snapshot()
         for sock in list(self.host_sockets):
-            with suppress(Exception):
-                await sock.send_json(envelope("state_snapshot", snapshot))
-
-    async def send_snapshot(self, sock: WebSocket) -> None:
-        with suppress(Exception):
-            await sock.send_json(envelope("state_snapshot", self._snapshot()))
+            await self.send_snapshot(sock, "host")
+        for wid, sock in list(self.worker_sockets.items()):
+            await self.send_snapshot(sock, "worker", wid)
 
 
 ws = WSManager()

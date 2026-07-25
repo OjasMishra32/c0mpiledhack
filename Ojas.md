@@ -62,6 +62,13 @@ So build it defensively and boringly:
 | **H6–H7** | `fusion.py` + `event_watcher.py`; integrate Zechariah's planner, Nikki's recovery, Steven's tracker | semantic events appear in the timeline; deviation → replan works untouched |
 | **H7–H8** | `adjudicator.py`, "Ask the feed", `test_e2e_flagship.py`, `make demo`, rehearse 5× | you can run the 90-second script without looking at the terminal |
 
+**Status: H0–H6 are built and green.** `models · config · state · websocket_manager ·
+orchestrator · host_commands · main · key_pool · attribution · perception/{nim_client,
+analyzer} · vision/bridge · integrations/voygr` all exist and are integrated with the
+planner, scheduler and vision workstreams. 109 tests pass with no key, no camera and no
+network, under every `PYTHONHASHSEED`. What is left on this file: `adjudicator.py` wiring
+into the deviation path, and "Ask the feed" on the host UI.
+
 Get to end-of-H2 fast — everyone is blocked on the socket contract being real. **Do not start the
 VLM layer before H5.** It is the most impressive part and the most tempting to start early, and it
 is worth exactly nothing if the orchestration loop underneath it doesn't run.
@@ -652,6 +659,37 @@ vlm_fast_timeout: float = 2.5
 vlm_reason_timeout: float = 8.0
 vlm_enabled: bool = True
 ```
+
+---
+
+## 8c. Attribution — delegating on evidence, not just capability
+
+> Built and wired: `backend/app/attribution.py`.
+
+The scheduler answers **who *can* do this** — capability, reachability, current load. That
+is necessary and not sufficient. Two workers can both be able and still be very different
+choices. Attribution answers **who *should*** from what has actually happened in this run:
+
+| Signal | What it means |
+| --- | --- |
+| `reliability` | when they said "done", did the world agree? |
+| `mean_seconds` | rolling dispatch→verified over their last five actions |
+| `zones` / `objects` | where and what they have already worked successfully |
+| `last_finished_at` | recency, so work stays visibly spread across all five |
+
+Nobody is rated ahead of time. HIVE builds the picture from the run and can defend every
+number it uses — which is the whole point, because the explanation goes on the projector:
+
+> **DELTA selected on record:** every report so far has verified, has worked this area 2×.
+> CHARLIE scored better on position alone.
+
+**The ordering rule matters and is deliberate:** capability decides who is *eligible*;
+attribution only re-orders candidates the scheduler already judged viable. A worker who
+fails once slides down the list — they are never exiled from the demo, which would be both
+unfair and boring to watch.
+
+Surfaced as `contributions` in `state_snapshot` and in the `goal_completed` payload, plus a
+one-sentence after-action line built from what actually happened. Cleared by `reset()`.
 
 ---
 
