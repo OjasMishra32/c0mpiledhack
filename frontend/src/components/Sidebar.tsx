@@ -1,5 +1,5 @@
 import type { Action, Goal, Worker, Zone } from '../types/hive';
-import { Panel, Rule, SectionHeading, Stat, WorkerRow } from './primitives';
+import { Panel, Rule, SectionLabel, Stat, StatusIndicator, WorkerRow } from './primitives';
 
 interface Contribution {
   worker_id: string;
@@ -24,18 +24,22 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
 
   return (
     <Panel className="border-r border-separator" scroll>
-      <div className="flex flex-col gap-5 px-4 py-4">
+      {/* One vertical rhythm the whole column obeys: 24px between sections,
+          12px between a label and the thing it labels. */}
+      <div className="flex flex-col gap-6 px-4 py-5">
         <section>
-          <SectionHeading>Objective</SectionHeading>
+          <SectionLabel>Objective</SectionLabel>
           {goal ? (
-            <div className="mt-2 flex flex-col gap-1">
-              <span className="text-[14px] leading-snug text-text-primary">{goal.raw_text}</span>
+            <div className="mt-3 flex flex-col gap-2">
+              <span className="text-[15px] leading-snug text-text-primary">{goal.raw_text}</span>
               {goal.planner_notes && (
-                <span className="text-[12px] text-text-tertiary">{goal.planner_notes}</span>
+                <span className="text-[13px] leading-relaxed text-text-tertiary">
+                  {goal.planner_notes}
+                </span>
               )}
             </div>
           ) : (
-            <p className="mt-2 text-[13px] leading-relaxed text-text-tertiary">
+            <p className="mt-3 text-[13px] leading-relaxed text-text-tertiary">
               Scan the scene, then state an objective. HIVE binds it to the items it can
               actually see.
             </p>
@@ -43,12 +47,19 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
         </section>
 
         {goal && actions.length > 0 && (
-          <section className="flex flex-col gap-2">
-            <div className="flex items-center gap-6">
+          <section>
+            <div className="flex items-start gap-8">
               <Stat value={actions.length} label="Actions" />
               <Stat value={verified} label="Verified" />
             </div>
-            <div className="h-0.5 w-full overflow-hidden rounded-full bg-surface-secondary">
+            <div
+              className="mt-4 h-1 w-full overflow-hidden rounded-control bg-surface-elevated"
+              role="progressbar"
+              aria-label="Actions verified"
+              aria-valuenow={verified}
+              aria-valuemin={0}
+              aria-valuemax={actions.length}
+            >
               <div
                 className="h-full bg-success transition-[width] duration-500 ease-standard"
                 style={{ width: `${actions.length ? (verified / actions.length) * 100 : 0}%` }}
@@ -60,8 +71,10 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
         <Rule />
 
         <section>
-          <SectionHeading>Workers</SectionHeading>
-          <div className="mt-2 flex flex-col gap-0.5">
+          <SectionLabel>Workers</SectionLabel>
+          {/* Rows bleed 8px past the column padding so their hover fill looks
+              deliberate while the text stays on the same left edge as the labels. */}
+          <div className="-mx-2 mt-2 flex flex-col gap-0.5">
             {workers.map((w) => (
               <WorkerRow
                 key={w.id}
@@ -83,17 +96,19 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
           <>
             <Rule />
             <section>
-              <SectionHeading>Areas</SectionHeading>
-              <div className="mt-2 flex flex-col gap-1.5">
+              <SectionLabel>Areas</SectionLabel>
+              <div className="mt-2 flex flex-col">
                 {zones.map((z) => (
-                  <div key={z.id} className="flex items-center justify-between">
-                    <span className="text-[13px] text-text-secondary">{z.label}</span>
-                    <div className="flex items-center gap-1">
+                  <div key={z.id} className="flex h-7 items-center justify-between gap-3">
+                    <span className="truncate text-[13px] text-text-secondary">{z.label}</span>
+                    <div className="flex shrink-0 items-center gap-1">
                       {z.occupancy.map((oid) => (
-                        <span key={oid} className="h-1.5 w-1.5 rounded-full bg-text-tertiary" />
+                        <StatusIndicator key={oid} size={6} />
                       ))}
                       {z.occupancy.length === 0 && (
-                        <span className="text-[11px] text-text-tertiary">empty</span>
+                        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-text-tertiary">
+                          Empty
+                        </span>
                       )}
                     </div>
                   </div>

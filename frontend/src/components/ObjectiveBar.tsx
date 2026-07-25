@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { Goal } from '../types/hive';
+import { PrimaryButton, ToolbarButton } from './primitives';
 
 interface ScenarioSummary {
   id: string;
@@ -54,8 +55,9 @@ export function ObjectiveBar({
   const compiled = Boolean(goal);
 
   return (
-    <div className="flex flex-col border-b border-separator bg-surface-primary">
-      <div className="flex items-center gap-3 px-4 py-2.5">
+    <div className="flex shrink-0 flex-col border-b border-separator bg-surface-primary">
+      {/* Same 36px control height as the toolbar above it, same 16px gutters. */}
+      <div className="flex items-center gap-2 px-4 py-2.5">
         <input
           value={draft}
           onChange={(e) => {
@@ -66,34 +68,31 @@ export function ObjectiveBar({
             if (e.key === 'Enter' && draft.trim()) onCompile(draft.trim());
           }}
           placeholder="Enter an operational objective…"
+          aria-label="Operational objective"
           spellCheck={false}
-          className="min-w-0 flex-1 bg-transparent text-[15px] text-text-primary outline-none placeholder:text-text-tertiary"
+          className="h-9 min-w-0 flex-1 rounded-control bg-surface-secondary px-3 text-[15px] leading-none text-text-primary placeholder:text-text-tertiary"
         />
 
-        <span className="hidden shrink-0 text-[12px] text-text-tertiary sm:inline">
+        <span className="hidden shrink-0 px-1 text-[11px] font-semibold uppercase tabular-nums tracking-[0.14em] text-text-tertiary sm:inline">
           {objectCount} item{objectCount === 1 ? '' : 's'} detected
         </span>
 
-        <button
-          onClick={onScan}
-          className="shrink-0 rounded-[--r-control] px-2.5 py-1.5 text-[13px] text-text-secondary transition-colors hover:bg-surface-secondary hover:text-text-primary"
-        >
-          Scan scene
-        </button>
+        <ToolbarButton onClick={onScan}>Scan scene</ToolbarButton>
 
-        <button
+        {/* The one filled accent control in the header — compiling is the act the
+            whole screen is waiting on. */}
+        <PrimaryButton
           onClick={() => draft.trim() && onCompile(draft.trim())}
           disabled={executing || !draft.trim()}
-          className="shrink-0 rounded-[--r-control] bg-hive-accent px-3 py-1.5 text-[13px] font-medium text-hive-accent-ink transition-opacity disabled:opacity-30"
         >
           Compile
-        </button>
+        </PrimaryButton>
 
         <select
           value={scenario?.id ?? ''}
           onChange={(e) => onScenario(e.target.value)}
           aria-label="Scenario"
-          className="shrink-0 rounded-[--r-control] bg-surface-secondary px-2 py-1.5 text-[12px] text-text-secondary outline-none"
+          className="h-9 shrink-0 rounded-control bg-surface-secondary px-3 text-[13px] text-text-secondary"
         >
           {scenarios.map((s) => (
             <option key={s.id} value={s.id}>
@@ -104,11 +103,11 @@ export function ObjectiveBar({
       </div>
 
       {compiled && stats && (
-        <div className="flex items-center gap-2 px-4 pb-2 text-[12px] text-text-tertiary">
-          <span className="rounded-full border border-separator-strong px-2 py-0.5 text-[11px] uppercase tracking-wide text-text-secondary">
+        <div className="flex items-center gap-3 px-4 pb-2.5 text-[13px] text-text-secondary">
+          <span className="rounded-control border border-separator-strong px-2 py-1 text-[11px] font-semibold uppercase leading-none tracking-[0.14em] text-text-secondary">
             {SOURCE_LABEL[goal!.plan_source] ?? goal!.plan_source}
           </span>
-          <span>
+          <span className="tabular-nums">
             {stats.actions ?? stats.action_count} actions · {stats.parallel_peak} executable in
             parallel · {stats.depth ?? stats.layer_count} stages
           </span>
@@ -116,13 +115,13 @@ export function ObjectiveBar({
       )}
 
       {pending && (
-        <div className="flex items-center gap-2 border-t border-separator bg-surface-secondary px-4 py-2 text-[13px]">
-          <span className="text-text-primary">{pending.message}</span>
+        <div className="flex items-center gap-2 border-t border-separator bg-surface-secondary px-4 py-2.5">
+          <span className="mr-1 text-[13px] text-text-primary">{pending.message}</span>
           {pending.candidates.map((id) => (
             <button
               key={id}
               onClick={() => onBind(id, pending.phrase)}
-              className="rounded-[--r-control] border border-separator-strong px-2 py-1 text-[12px] text-text-secondary transition-colors hover:border-information hover:text-text-primary"
+              className="h-8 shrink-0 rounded-control border border-separator-strong px-3 text-[13px] font-medium text-text-secondary transition-colors duration-150 ease-standard hover:border-information hover:text-text-primary"
             >
               {id}
             </button>

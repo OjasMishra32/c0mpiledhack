@@ -28,28 +28,39 @@ interface WorkerRowProps {
 
 export function WorkerRow({ worker, currentInstruction, note, selected = false, onSelect }: WorkerRowProps) {
   const dimmed = !worker.connected;
+  const name = worker.callsign || worker.display_name;
 
   return (
     <button
       onClick={onSelect}
-      className={`flex w-full flex-col gap-1 rounded-control px-3 py-2.5 text-left transition-colors duration-150 ease-standard ${
-        selected ? 'bg-surface-secondary' : 'hover:bg-surface-secondary/60'
+      aria-pressed={selected}
+      aria-label={`${name} — ${STATUS_TEXT[worker.status]}`}
+      className={`flex w-full flex-col gap-1.5 rounded-control px-2 py-2.5 text-left transition-colors duration-150 ease-standard ${
+        selected ? 'bg-surface-secondary' : 'hover:bg-[rgb(var(--surface-secondary-rgb)/0.6)]'
       } ${dimmed ? 'opacity-40' : ''}`}
     >
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="h-2 w-1 rounded-full" style={{ backgroundColor: worker.color }} />
-          <span className={`text-[14px] font-medium text-text-primary ${worker.status === 'unavailable' ? 'line-through' : ''}`}>
-            {worker.callsign || worker.display_name}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="h-3 w-1 shrink-0 rounded-full" style={{ backgroundColor: worker.color }} />
+          <span
+            className={`truncate text-[14px] font-medium leading-none text-text-primary ${
+              worker.status === 'unavailable' ? 'line-through' : ''
+            }`}
+          >
+            {name}
           </span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-1.5">
           <StatusIndicator tone={statusTone(worker.status)} outline={dimmed} />
-          <span className="text-[12px] text-text-tertiary">{STATUS_TEXT[worker.status]}</span>
+          <span className="text-[11px] font-semibold uppercase leading-none tracking-[0.1em] text-text-tertiary">
+            {STATUS_TEXT[worker.status]}
+          </span>
         </div>
       </div>
-      <span className="text-[13px] text-text-secondary">{currentInstruction ?? 'Stand by'}</span>
-      {note && <span className="text-[11px] text-text-tertiary">{note}</span>}
+      <span className="truncate pl-3 text-[13px] leading-snug text-text-secondary">
+        {currentInstruction ?? 'Stand by'}
+      </span>
+      {note && <span className="truncate pl-3 text-[11px] leading-none text-text-tertiary">{note}</span>}
     </button>
   );
 }

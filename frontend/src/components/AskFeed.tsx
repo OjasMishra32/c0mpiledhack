@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { ToolbarButton } from './primitives';
 
 /**
  * Ask the live camera a question.
@@ -37,14 +38,7 @@ export function AskFeed({ answer, available, onAsk, onDismiss }: AskFeedProps) {
   }, [answer, onDismiss]);
 
   if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="rounded-[--r-control] px-2.5 py-1.5 text-[13px] text-text-secondary transition-colors hover:bg-surface-secondary hover:text-text-primary"
-      >
-        Ask the feed
-      </button>
-    );
+    return <ToolbarButton onClick={() => setOpen(true)}>Ask the feed</ToolbarButton>;
   }
 
   return (
@@ -62,25 +56,28 @@ export function AskFeed({ answer, available, onAsk, onDismiss }: AskFeedProps) {
           }
         }}
         placeholder={available ? 'Ask about what the camera sees…' : 'Scene reasoning unavailable'}
+        aria-label="Ask the camera feed a question"
         disabled={!available}
         spellCheck={false}
-        className="w-64 rounded-[--r-control] bg-surface-secondary px-2.5 py-1.5 text-[13px] text-text-primary outline-none placeholder:text-text-tertiary disabled:opacity-40"
+        className="h-9 w-72 rounded-control bg-surface-secondary px-3 text-[14px] leading-none text-text-primary placeholder:text-text-tertiary disabled:opacity-40"
       />
-      <button
-        onClick={() => setOpen(false)}
-        className="text-[12px] text-text-tertiary hover:text-text-secondary"
-      >
-        Close
-      </button>
+      <ToolbarButton onClick={() => setOpen(false)}>Close</ToolbarButton>
 
       {(pending || answer) && (
-        <div className="absolute right-0 top-9 z-40 w-96 rounded-[--r-surface] border border-separator-strong bg-surface-elevated p-3 shadow-2xl">
+        <div
+          role="status"
+          aria-live="polite"
+          className="absolute right-0 top-11 z-40 w-[420px] rounded-surface border border-separator-strong bg-surface-elevated p-4 shadow-2xl"
+        >
           {pending && !answer ? (
-            <span className="text-[13px] text-text-tertiary">Looking…</span>
+            <span className="text-[14px] text-text-tertiary">Looking…</span>
           ) : (
             <>
-              <p className="text-[12px] text-text-tertiary">{answer!.question}</p>
-              <p className="mt-1 text-[14px] leading-snug text-text-primary">{answer!.answer}</p>
+              <p className="text-[11px] font-semibold uppercase leading-none tracking-[0.14em] text-text-tertiary">
+                Asked
+              </p>
+              <p className="mt-2 text-[14px] leading-snug text-text-secondary">{answer!.question}</p>
+              <p className="mt-3 text-[16px] leading-snug text-text-primary">{answer!.answer}</p>
             </>
           )}
         </div>

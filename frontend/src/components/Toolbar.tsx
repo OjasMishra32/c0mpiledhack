@@ -1,6 +1,6 @@
 import type { Goal, WorldMode } from '../types/hive';
 import { AskFeed } from './AskFeed';
-import { PrimaryButton, DangerButton, ToolbarButton, StatusIndicator } from './primitives';
+import { SecondaryButton, DangerButton, ToolbarButton, StatusIndicator } from './primitives';
 
 interface ToolbarProps {
   goal: Goal | null;
@@ -30,28 +30,34 @@ export function Toolbar({
   feedAnswer = null, feedAvailable = false, onAsk, onDismissFeed,
 }: ToolbarProps) {
   return (
-    <header className="flex h-14 items-center gap-4 border-b border-separator bg-surface-primary px-4">
-      <span className="text-[15px] font-semibold tracking-tight text-text-primary">HIVE</span>
+    <header className="flex h-14 shrink-0 items-center gap-4 border-b border-separator bg-surface-primary px-4">
+      <span className="shrink-0 text-[15px] font-semibold uppercase tracking-[0.16em] text-text-primary">
+        HIVE
+      </span>
 
-      <div className="flex items-center gap-1.5 text-[13px] text-text-secondary">
+      <div className="flex shrink-0 items-center gap-2 text-[13px] text-text-secondary">
         <StatusIndicator tone={connectedWorkers > 0 ? 'success' : 'neutral'} />
-        <span>{connectedWorkers}/{totalWorkers} workers connected</span>
+        <span className="tabular-nums">
+          {connectedWorkers}/{totalWorkers} workers connected
+        </span>
       </div>
 
       {/* A dropped socket is a chip, never a modal — the demo keeps going. */}
       {!connected && (
-        <span className="text-[12px] text-warning">
-          {reconnecting ? 'Reconnecting…' : 'Offline'}
+        <span
+          role="status"
+          className="shrink-0 rounded-control border border-separator-strong px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-warning"
+        >
+          {reconnecting ? 'Reconnecting' : 'Offline'}
         </span>
       )}
 
-      {goal && (
-        <span className="max-w-[420px] truncate text-[14px] text-text-secondary" title={goal.raw_text}>
-          {goal.raw_text}
-        </span>
-      )}
+      {/* The objective itself lives in the objective bar and the sidebar; echoing it
+          here only ate the room the controls need. */}
 
-      <span className="text-[13px] text-text-tertiary">{MODE_LABEL[mode]}</span>
+      <span className="shrink-0 text-[11px] font-semibold uppercase tracking-[0.14em] text-text-tertiary">
+        {MODE_LABEL[mode]}
+      </span>
 
       <div className="ml-auto flex items-center gap-2">
         {onAsk && (
@@ -65,9 +71,9 @@ export function Toolbar({
         <ToolbarButton onClick={onOpenInspector} className="xl:hidden">Inspector</ToolbarButton>
         <ToolbarButton onClick={onOpenGraph}>Task graph</ToolbarButton>
         {executing ? (
-          <ToolbarButton onClick={onPause}>Pause</ToolbarButton>
+          <SecondaryButton onClick={onPause}>Pause</SecondaryButton>
         ) : (
-          <PrimaryButton onClick={onStart} disabled={!goal}>Start execution</PrimaryButton>
+          <SecondaryButton onClick={onStart} disabled={!goal}>Start execution</SecondaryButton>
         )}
         <ToolbarButton onClick={onReset}>Reset</ToolbarButton>
         <DangerButton onClick={onEmergencyStop}>Emergency stop</DangerButton>
