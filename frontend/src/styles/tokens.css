@@ -1,0 +1,51 @@
+:root {
+  /* surfaces — near-black, never pure black; pure black kills depth on projectors */
+  --bg-0:  #08090B;   /* page */
+  --bg-1:  #0E1013;   /* panel */
+  --bg-2:  #14171C;   /* raised */
+  --line:  #1E232B;   /* hairline */
+  --line-strong: #2B323C;
+
+  /* text */
+  --fg-0:  #F5F7FA;   /* primary */
+  --fg-1:  #A2ACBB;   /* secondary */
+  --fg-2:  #626C7A;   /* tertiary / labels */
+
+  /* semantic */
+  --ok:    #30D158;
+  --warn:  #FF9F0A;
+  --crit:  #FF375F;
+  --info:  #5AC8FA;
+  --think: #5E5CE6;   /* planning / replanning */
+
+  /* worker identity — fixed, matches backend */
+  --w-a: #5AC8FA; --w-b: #5E5CE6; --w-c: #30D158; --w-d: #FF9F0A; --w-e: #FF375F;
+  /* NOTE: there are NO object colors here. Objects are discovered at runtime and carry their own
+     sampled `descriptor.color_hex`. Render that value directly — never map an object to a palette
+     constant. If you find yourself writing OBJECT_COLORS = {...}, stop. */
+
+  --r-sm: 8px; --r-md: 14px; --r-lg: 20px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);   /* the only easing you use */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg-0);
+  color: var(--fg-0);
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+}
