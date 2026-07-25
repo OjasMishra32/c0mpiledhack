@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from app.models import Descriptor, Point
+from app.models import Descriptor, Vec2
 
 KERNEL_3 = np.ones((3, 3), np.uint8)
 KERNEL_5 = np.ones((5, 5), np.uint8)
@@ -50,7 +50,7 @@ def hsv_to_hex(h: float, s: float, v: float) -> str:
 
 @dataclass
 class Detection:
-    position: Point
+    position: Vec2
     dominant_hsv: tuple[int, int, int]
     color_name: str
     color_hex: str
@@ -131,7 +131,7 @@ class SceneDiscovery:
             x, y, w, h_box = cv2.boundingRect(region)
             aspect = w / h_box if h_box else 1.0
             out.append(Detection(
-                position=Point(x=cx / W, y=cy / H),
+                position=Vec2(x=cx / W, y=cy / H),
                 dominant_hsv=(int(h), int(s), int(v)),
                 color_name=name_hue(h, s, v),
                 color_hex=hsv_to_hex(h, s, v),
@@ -284,7 +284,7 @@ class StableTracker:
         med = np.median(pts, axis=0)
         spread = float(np.std(pts, axis=0).mean())
         return Smoothed(
-            position=Point(x=float(med[0]), y=float(med[1])),
+            position=Vec2(x=float(med[0]), y=float(med[1])),
             confidence=det.confidence * (1.0 if spread < 0.03 else 0.7),
             settled=spread < 0.02,
         )
@@ -295,12 +295,12 @@ class StableTracker:
 
 @dataclass
 class Smoothed:
-    position: Point
+    position: Vec2
     confidence: float
     settled: bool
 
 
-def associate(detections: list[Detection], existing_ids: dict[str, Point]) -> dict[str, int | None]:
+def associate(detections: list[Detection], existing_ids: dict[str, Vec2]) -> dict[str, int | None]:
     """Greedy nearest-neighbour association on cost = 3.0*position_dist + 1.0*hue_dist
     (area term omitted here; hue+position is sufficient for well-separated tabletop
     objects and avoids pulling in scipy for a 5-object hackathon demo).

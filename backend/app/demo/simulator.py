@@ -8,7 +8,7 @@ import random
 import time
 from dataclasses import dataclass, field
 
-from app.models import Descriptor, ObservedObject, Point
+from app.models import Descriptor, ObservedObject, Vec2
 from app.state import HiveState
 from app.vision.scene_discovery import hsv_to_hex, name_hue
 
@@ -26,8 +26,8 @@ class SimWorker:
 @dataclass
 class _Motion:
     object_id: str
-    start: Point
-    target: Point
+    start: Vec2
+    target: Vec2
     started_at: float
     duration: float = MOVE_SECONDS
     on_complete: object = None
@@ -60,7 +60,7 @@ class Simulator:
                 circularity=circularity,
                 shape_hint=shape,
             )
-            pos = Point(x=round(random.uniform(0.1, 0.9), 3), y=round(random.uniform(0.1, 0.9), 3))
+            pos = Vec2(x=round(random.uniform(0.1, 0.9), 3), y=round(random.uniform(0.1, 0.9), 3))
             objects.append(ObservedObject(
                 id=f"obj_{i}",
                 descriptor=descriptor,
@@ -85,14 +85,14 @@ class Simulator:
                 return h
         return random.randint(0, 179)
 
-    def _classify(self, p: Point) -> str:
+    def _classify(self, p: Vec2) -> str:
         for z in self.state.scene.zones:
             if z.bounds.contains(p):
                 return z.id
         return "field"
 
     # ---- interaction --------------------------------------------------
-    def drag(self, object_id: str, position: Point) -> None:
+    def drag(self, object_id: str, position: Vec2) -> None:
         for o in self.state.scene.objects:
             if o.id == object_id:
                 o.position = position
@@ -102,18 +102,18 @@ class Simulator:
         self.state.world.objects = self.state.scene.objects
         self.state.mark_world_dirty()
 
-    async def auto_execute(self, object_id: str, target: Point) -> None:
+    async def auto_execute(self, object_id: str, target: Vec2) -> None:
         """Animate the object toward the target over ~1.5s, then report completion.
         Never teleports — the interpolation is most of why this looks premium."""
         obj = next((o for o in self.state.scene.objects if o.id == object_id), None)
         if obj is None:
             return
-        start = Point(x=obj.position.x, y=obj.position.y)
+        start = Vec2(x=obj.position.x, y=obj.position.y)
         t0 = time.time()
         while True:
             elapsed = time.time() - t0
             frac = min(1.0, elapsed / MOVE_SECONDS)
-            obj.position = Point(
+            obj.position = Vec2(
                 x=start.x + (target.x - start.x) * frac,
                 y=start.y + (target.y - start.y) * frac,
             )
@@ -160,7 +160,7 @@ class Simulator:
                     if o.id == target_id:
                         cx = wrong.bounds.x + wrong.bounds.w / 2
                         cy = wrong.bounds.y + wrong.bounds.h / 2
-                        o.position = Point(x=cx, y=cy)
+                        o.position = Vec2(x=cx, y=cy)
                         o.zone = wrong.id
                         o.confidence = 0.9
         elif kind == "verification_regress" and target_id:

@@ -8,12 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 from pathlib import Path
 
 import numpy as np
 
-from app.models import Descriptor, ObservedObject, Point, Rect, Zone
+from app.models import Bounds, Descriptor, ObservedObject, Vec2, Zone, utc_now
 from app.state import HiveState
 from app.vision.scene_discovery import (
     Detection,
@@ -45,7 +44,17 @@ def merge_descriptor(old: Descriptor, det: Detection) -> Descriptor:
     h = round(h_old * (1 - EMA_ALPHA) + h_new * EMA_ALPHA)
     s = round(s_old * (1 - EMA_ALPHA) + s_new * EMA_ALPHA)
     v = round(v_old * (1 - EMA_ALPHA) + v_new * EMA_ALPHA)
-    return det.to_descriptor().model_copy(update={"dominant_hsv": (h, s, v)})
+    return det.to_descriptor().model_copy(update={"dominant_hsv": [h, s, v]})
+
+
+def _contains(bounds: Bounds, p: Vec2, margin: float = 0.0) -> bool:
+    """Bounds.contains() (models.py) has no margin param — this is the
+    hysteresis-aware version used only here, so raising/lowering the margin
+    doesn't change behavior for other consumers of the shared Bounds type."""
+    return (
+        bounds.x - margin <= p.x <= bounds.x + bounds.w + margin
+        and bounds.y - margin <= p.y <= bounds.y + bounds.h + margin
+    )
 
 
 class WorldModel:
@@ -94,7 +103,7 @@ class WorldModel:
                     severity="info",
                     metadata={"object_id": obj.id, "from": prev, "to": new_zone},
                 )
-            obj.last_updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            obj.last_updated_at = utc_now()
             obj.source = "vision"
 
         for i, det in enumerate(detections):
@@ -134,16 +143,16 @@ class WorldModel:
         )
 
     # ---- zones ----------------------------------------------------------
-    def classify_zone(self, p: Point, current: str | None = None) -> str:
+    def classify_zone(self, p: Vec2, current: str | None = None) -> str:
         """`current`, if given, gets a sticky +HYSTERESIS margin (stays put on a
         border). Any other zone needs the object -HYSTERESIS *inside* its bounds
         to be assigned — an object sitting on a taped line does not flap zones."""
         if current and current != "field":
             cur = next((z for z in self.state.scene.zones if z.id == current), None)
-            if cur and cur.bounds.contains(p, margin=HYSTERESIS):
+            if cur and _contains(cur.bounds, p, margin=HYSTERESIS):
                 return current
         for z in self.state.scene.zones:
-            if z.bounds.contains(p, margin=-HYSTERESIS):
+            if _contains(z.bounds, p, margin=-HYSTERESIS):
                 return z.id
         return "field"
 
@@ -155,7 +164,7 @@ class WorldModel:
                      label: str, source: str = "drawn") -> Zone:
         x, y, w, h = bounds
         zid = zone_id or f"zone_{len(self.state.scene.zones) + 1}"
-        zone = Zone(id=zid, label=label, bounds=Rect(x=x, y=y, w=w, h=h), source=source)
+        zone = Zone(id=zid, label=label, bounds=Bounds(x=x, y=y, w=w, h=h), source=source)
         self.state.scene.zones = [z for z in self.state.scene.zones if z.id != zid] + [zone]
         self.state.world.zones = self.state.scene.zones
         self.state.mark_world_dirty()
@@ -180,7 +189,7 @@ class WorldModel:
             ))
         self.state.scene.objects = objects
         self.state.scene.object_count = len(objects)
-        self.state.scene.scanned_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.state.scene.scanned_at = utc_now()
         self.state.scene.stable = False
         self.state.world.objects = objects
         self.state.mark_world_dirty()

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.demo.simulator import Simulator
+from app.models import utc_now
 from app.state import state
 from app.vision.calibration import Calibration
 from app.vision.camera import Camera
@@ -82,7 +83,7 @@ async def _vision_loop() -> None:
                         detections = world_model.discovery.discover(small, calibration)
                         world_model.ingest(detections)
                         state.world.camera_online = True
-                        state.world.last_frame_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        state.world.last_frame_at = utc_now()
                         frame_count += 1
                 else:
                     state.world.camera_online = False

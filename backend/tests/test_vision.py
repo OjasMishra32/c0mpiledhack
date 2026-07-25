@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from app.models import Point, Rect, Zone
+from app.models import Vec2, Bounds, Zone
 from app.state import HiveState
 from app.vision.scene_discovery import (
     Detection,
@@ -112,7 +112,7 @@ def test_split_touching_blobs():
 def _det(x, y, hue=0, conf=0.9):
     from app.models import Descriptor
     return Detection(
-        position=Point(x=x, y=y),
+        position=Vec2(x=x, y=y),
         dominant_hsv=(hue, 220, 200),
         color_name=name_hue(hue, 220, 200),
         color_hex="#FF0000",
@@ -153,9 +153,9 @@ def test_new_object_appears():
 
 def test_zone_classification():
     wm, state = make_world_model()
-    state.scene.zones = [Zone(id="zone_1", label="A", bounds=Rect(x=0.0, y=0.0, w=0.5, h=0.5))]
-    assert wm.classify_zone(Point(x=0.1, y=0.1)) == "zone_1"
-    assert wm.classify_zone(Point(x=0.9, y=0.9)) == "field"
+    state.scene.zones = [Zone(id="zone_1", label="A", bounds=Bounds(x=0.0, y=0.0, w=0.5, h=0.5))]
+    assert wm.classify_zone(Vec2(x=0.1, y=0.1)) == "zone_1"
+    assert wm.classify_zone(Vec2(x=0.9, y=0.9)) == "field"
 
 
 def test_zone_autodetect():
@@ -169,8 +169,8 @@ def test_stability_filter():
     for _ in range(3):
         wm.ingest([_det(0.2, 0.2)])
     state.scene.zones = [
-        Zone(id="zone_1", label="A", bounds=Rect(x=0.0, y=0.0, w=0.3, h=0.3)),
-        Zone(id="zone_2", label="B", bounds=Rect(x=0.6, y=0.6, w=0.3, h=0.3)),
+        Zone(id="zone_1", label="A", bounds=Bounds(x=0.0, y=0.0, w=0.3, h=0.3)),
+        Zone(id="zone_2", label="B", bounds=Bounds(x=0.6, y=0.6, w=0.3, h=0.3)),
     ]
     wm.ingest([_det(0.15, 0.15)])
     zone_before = state.scene.objects[0].zone
@@ -181,8 +181,8 @@ def test_stability_filter():
 def test_hysteresis():
     wm, state = make_world_model()
     state.scene.zones = [
-        Zone(id="zone_1", label="A", bounds=Rect(x=0.0, y=0.0, w=0.5, h=1.0)),
-        Zone(id="zone_2", label="B", bounds=Rect(x=0.5, y=0.0, w=0.5, h=1.0)),
+        Zone(id="zone_1", label="A", bounds=Bounds(x=0.0, y=0.0, w=0.5, h=1.0)),
+        Zone(id="zone_2", label="B", bounds=Bounds(x=0.5, y=0.0, w=0.5, h=1.0)),
     ]
     for _ in range(4):
         wm.ingest([_det(0.48, 0.5)])
@@ -223,7 +223,7 @@ async def test_simulator_completes_action():
     sim = Simulator(state)
     sim.spawn_scene(n=1)
     obj = state.scene.objects[0]
-    target = Point(x=0.9, y=0.9)
+    target = Vec2(x=0.9, y=0.9)
     await sim.auto_execute(obj.id, target)
     final = state.scene.objects[0]
     assert abs(final.position.x - target.x) < 0.01
