@@ -315,3 +315,31 @@ export interface PlanCompiledPayload {
     [key: string]: unknown;
   };
 }
+
+
+/** Run metrics — mirrors backend/app/models.py RunMetrics. */
+export interface RunMetrics {
+  actions_total: number;
+  actions_verified: number;
+  parallel_peak: number;
+  recoveries: number;
+  reassignments: number;
+  deviations: number;
+  conflicts: number;
+  avg_confidence: number;
+  worker_idle_seconds: number;
+  started_at: string | null;
+  completed_at: string | null;
+  elapsed_seconds: number;
+}
+
+/** Per-worker contribution — mirrors backend/app/attribution.py. */
+export interface Contribution {
+  worker_id: string;
+  callsign: string;
+  completed: number;
+  failed: number;
+  reliability: number;
+  mean_seconds: number | null;
+  zones: Record<string, number>;
+}

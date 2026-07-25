@@ -1,6 +1,4 @@
-import { useState } from 'react';
 import type { Action, Goal, ObservedObject, Worker, Zone } from '../types/hive';
-import { AdvancedControls } from './AdvancedControls';
 import { EmptyState, InspectorRow, Panel, Rule, SectionHeading, StatusIndicator } from './primitives';
 
 export type Selection =
@@ -17,38 +15,22 @@ interface InspectorProps {
   workers: Worker[];
   objects: ObservedObject[];
   zones: Zone[];
-  onSend?: (type: string) => void;
+  onSend?: (type: string, payload?: Record<string, unknown>) => void;
 }
 
 function objectLabel(o: ObservedObject): string {
   return o.role ?? o.semantic_label ?? `${o.descriptor.color_name} ${o.descriptor.shape_hint} object`;
 }
 
-export function Inspector({ selection, goal, actions, workers, objects, zones, onSend }: InspectorProps) {
-  const [tab, setTab] = useState<'context' | 'controls'>('context');
-
+export function Inspector({ selection, goal, actions, workers, objects, zones }: InspectorProps) {
   return (
     <Panel className="border-l border-separator">
-      <div className="flex items-center gap-1 border-b border-separator px-4 pb-2 pt-3.5">
-        {(['context', 'controls'] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`rounded-control px-2.5 py-1 text-[13px] font-medium transition-colors duration-150 ease-standard ${
-              tab === t ? 'bg-surface-secondary text-text-primary' : 'text-text-tertiary hover:text-text-secondary'
-            }`}
-          >
-            {t === 'context' ? 'Inspector' : 'Controls'}
-          </button>
-        ))}
+      <div className="border-b border-separator px-4 pb-2 pt-3.5">
+        <span className="text-[11px] uppercase tracking-wide text-text-tertiary">Inspector</span>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-        {tab === 'controls' ? (
-          <AdvancedControls onSend={onSend} />
-        ) : (
-          <InspectorContent selection={selection} goal={goal} actions={actions} workers={workers} objects={objects} zones={zones} />
-        )}
+        <InspectorContent selection={selection} goal={goal} actions={actions} workers={workers} objects={objects} zones={zones} />
       </div>
     </Panel>
   );

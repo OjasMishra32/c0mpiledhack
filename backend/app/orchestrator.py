@@ -416,11 +416,25 @@ def schedule_actions() -> None:
 
 
 def dispatch() -> None:
+    # One person, one live action. The scheduler enforces this when it batches, but this
+    # is the last gate before an instruction reaches a phone — and two instructions on one
+    # phone is the single most confusing thing that can happen to a person on stage.
+    busy = {
+        a.assigned_worker_id
+        for a in state.actions.values()
+        if a.status in DISPATCHABLE and a.assigned_worker_id
+    }
     for a in state.actions_with_status("assigned"):
         w = state.worker(a.assigned_worker_id)
         if not w:
             a.status = "available"
             continue
+        if w.id in busy:
+            a.assigned_worker_id = None
+            a.status = "available"
+            state.free_locks_for(a.id)
+            continue
+        busy.add(w.id)
         a.attempt += 1
         obj = state.scene.by_id(a.object_id) if a.object_id else None
         a.origin_zone = obj.zone if obj else None
@@ -576,6 +590,14 @@ def on_worker_completed(p: dict, wid: str | None) -> None:
         Evidence(kind="worker_report", confidence=float(p.get("confidence") or 1.0), detail="worker reported done")
     )
     a.status = "awaiting_verification"
+
+    # In simulation there is no camera to see the table, so the phone IS the actuator:
+    # a worker reporting completion moves the item. In live or assisted mode we never do
+    # this — vision is the authority, and faking the world would defeat the entire point
+    # of verifying against it.
+    if state.world.mode == "simulation" or not state.world.camera_online:
+        if a.object_id and a.target_zone:
+            world_model.move_object_to_zone(state, a.object_id, a.target_zone)
     state.emit_soon(
         "worker_reported",
         f"{state.callsign(wid)} reported completion. Verifying against the world state.",

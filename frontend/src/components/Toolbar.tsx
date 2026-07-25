@@ -7,8 +7,11 @@ interface ToolbarProps {
   totalWorkers: number;
   mode: WorldMode;
   executing: boolean;
+  connected?: boolean;
+  reconnecting?: boolean;
   onStart?: () => void;
   onPause?: () => void;
+  onReset?: () => void;
   onEmergencyStop?: () => void;
   onOpenGraph?: () => void;
   onOpenInspector?: () => void;
@@ -17,7 +20,8 @@ interface ToolbarProps {
 const MODE_LABEL: Record<WorldMode, string> = { live: 'Live', assisted: 'Assisted', simulation: 'Simulation' };
 
 export function Toolbar({
-  goal, connectedWorkers, totalWorkers, mode, executing, onStart, onPause, onEmergencyStop, onOpenGraph, onOpenInspector,
+  goal, connectedWorkers, totalWorkers, mode, executing, connected = true, reconnecting = false,
+  onStart, onPause, onReset, onEmergencyStop, onOpenGraph, onOpenInspector,
 }: ToolbarProps) {
   return (
     <header className="flex h-14 items-center gap-4 border-b border-separator bg-surface-primary px-4">
@@ -27,6 +31,13 @@ export function Toolbar({
         <StatusIndicator tone={connectedWorkers > 0 ? 'success' : 'neutral'} />
         <span>{connectedWorkers}/{totalWorkers} workers connected</span>
       </div>
+
+      {/* A dropped socket is a chip, never a modal — the demo keeps going. */}
+      {!connected && (
+        <span className="text-[12px] text-warning">
+          {reconnecting ? 'Reconnecting…' : 'Offline'}
+        </span>
+      )}
 
       {goal && (
         <span className="max-w-[420px] truncate text-[14px] text-text-secondary" title={goal.raw_text}>
@@ -44,6 +55,7 @@ export function Toolbar({
         ) : (
           <PrimaryButton onClick={onStart} disabled={!goal}>Start execution</PrimaryButton>
         )}
+        <ToolbarButton onClick={onReset}>Reset</ToolbarButton>
         <DangerButton onClick={onEmergencyStop}>Emergency stop</DangerButton>
       </div>
     </header>

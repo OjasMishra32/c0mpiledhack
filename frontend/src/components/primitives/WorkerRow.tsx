@@ -20,11 +20,13 @@ function statusTone(status: Worker['status']): StatusTone {
 interface WorkerRowProps {
   worker: Worker;
   currentInstruction?: string;
+  /** What this person has actually done this run — evidence, not decoration. */
+  note?: string;
   selected?: boolean;
   onSelect?: () => void;
 }
 
-export function WorkerRow({ worker, currentInstruction, selected = false, onSelect }: WorkerRowProps) {
+export function WorkerRow({ worker, currentInstruction, note, selected = false, onSelect }: WorkerRowProps) {
   const dimmed = !worker.connected;
 
   return (
@@ -38,7 +40,7 @@ export function WorkerRow({ worker, currentInstruction, selected = false, onSele
         <div className="flex items-center gap-2">
           <span className="h-2 w-1 rounded-full" style={{ backgroundColor: worker.color }} />
           <span className={`text-[14px] font-medium text-text-primary ${worker.status === 'unavailable' ? 'line-through' : ''}`}>
-            {worker.display_name}
+            {worker.callsign || worker.display_name}
           </span>
         </div>
         <div className="flex items-center gap-1.5">
@@ -47,6 +49,7 @@ export function WorkerRow({ worker, currentInstruction, selected = false, onSele
         </div>
       </div>
       <span className="text-[13px] text-text-secondary">{currentInstruction ?? 'Stand by'}</span>
+      {note && <span className="text-[11px] text-text-tertiary">{note}</span>}
     </button>
   );
 }

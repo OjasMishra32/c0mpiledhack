@@ -299,5 +299,15 @@ def _sync_occupancy(state: Any) -> None:
 
 
 def reset() -> None:
+    """Drop everything that accumulates between runs.
+
+    The world model carries a temporal stability tracker; keeping it across a reset means
+    run two inherits run one's frame history and can suppress a legitimate first movement.
+    Rebuilding is cheap — the camera itself is deliberately NOT touched, so a reset never
+    re-triggers a permission prompt or drops the feed mid-demo.
+    """
+    global _world, _sim
     _motions.clear()
     _overrides.clear()
+    _world = None
+    _sim = None

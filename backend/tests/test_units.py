@@ -301,3 +301,26 @@ async def test_unverified_claims_lower_a_workers_standing(state):
     assert delta > 0, "an unreliable reporter must be penalised"
     assert any("verified" in x for x in reasons)
     attribution.reset()
+
+
+async def test_one_worker_never_holds_two_live_actions(state):
+    """Two instructions on one phone is the most confusing thing that can happen to a
+    person on stage. Hold the invariant across many ticks, including through recovery."""
+    await H["host_compile_goal"]({"text": state.scenario.build_goal(state.scene)})
+    await H["host_start_execution"]({})
+
+    for i in range(25):
+        live = [a for a in state.actions.values()
+                if a.status in ("dispatched", "acknowledged", "executing")]
+        holders = [a.assigned_worker_id for a in live if a.assigned_worker_id]
+        assert len(holders) == len(set(holders)), (
+            f"tick {i}: a worker holds two live actions: {holders}"
+        )
+        if i == 6:  # disrupt mid-run and keep checking
+            victim = next((a.assigned_worker_id for a in live), None)
+            if victim:
+                await H["host_inject_failure"]({"kind": "worker_down", "target_id": victim})
+        for a in list(state.actions.values()):
+            if a.status in ("dispatched", "acknowledged", "executing"):
+                complete(a.id)
+        await run_ticks(2)
