@@ -12,3 +12,93 @@ body {
   margin: 0;
   overflow: hidden;
 }
+
+/* ── deviation choreography ──────────────────────────────────────────────
+   The one moment the demo is built around. Motion here is communicating a
+   state change, which is the only reason motion is allowed at all. */
+
+.dev-edge {
+  position: absolute;
+  background: var(--failure);
+}
+.dev-edge-t,
+.dev-edge-b {
+  left: 0;
+  right: 0;
+  height: 2px;
+  animation: dev-draw-x 300ms var(--ease-standard) both;
+}
+.dev-edge-l,
+.dev-edge-r {
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  animation: dev-draw-y 300ms var(--ease-standard) both;
+}
+.dev-edge-t { top: 0; transform-origin: left center; }
+.dev-edge-b { bottom: 0; transform-origin: right center; }
+.dev-edge-l { left: 0; transform-origin: center bottom; }
+.dev-edge-r { right: 0; transform-origin: center top; }
+
+@keyframes dev-draw-x {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+@keyframes dev-draw-y {
+  from { transform: scaleY(0); }
+  to   { transform: scaleY(1); }
+}
+
+.dev-scrim {
+  animation: dev-fade-in 200ms var(--ease-standard) both;
+}
+.dev-panel {
+  animation: dev-rise 400ms var(--ease-standard) 150ms both;
+}
+.dev-dissolving {
+  animation: dev-fade-out 400ms var(--ease-standard) both;
+}
+
+@keyframes dev-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes dev-fade-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+@keyframes dev-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Replanning marker. Deliberately the only thing moving while the panel is up. */
+.dev-working {
+  animation: dev-breathe 1.6s var(--ease-standard) infinite;
+}
+@keyframes dev-breathe {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 1; }
+}
+
+/* ── task graph ───────────────────────────────────────────────────────── */
+
+/* Executing work breathes in its worker's colour. Failure never animates —
+   a pulsing red node reads as a broken UI, not as a broken plan. */
+.node-executing {
+  animation: node-pulse 1.6s var(--ease-standard) infinite;
+}
+@keyframes node-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--node-glow); }
+  50%      { box-shadow: 0 0 14px 2px var(--node-glow); }
+}
+
+/* The unlocking moment: a highlight travels down the edges a verified node feeds. */
+.edge-unlocking {
+  stroke-dasharray: 14 220;
+  animation: edge-travel 400ms linear both;
+}
+@keyframes edge-travel {
+  from { stroke-dashoffset: 234; }
+  to   { stroke-dashoffset: 0; }
+}

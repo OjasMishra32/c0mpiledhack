@@ -9,10 +9,12 @@ import {
 } from '../lib/homography';
 import type { ObservedObject, Zone } from '../types/hive';
 import { CalibrationOverlay } from './spatial/CalibrationOverlay';
+import { DeviationMarker } from './spatial/DeviationMarker';
 import { Fallback2D } from './spatial/Fallback2D';
 import { ObjectAnchor } from './spatial/ObjectAnchor';
 import { PathLine } from './spatial/PathLine';
 import { TargetZone } from './spatial/TargetZone';
+import { Trajectory } from './spatial/Trajectory';
 import { VideoBackground } from './spatial/VideoBackground';
 import { SecondaryButton } from './primitives/Button';
 
@@ -32,10 +34,17 @@ export interface ActivePath {
   color?: string;
 }
 
+/** Where an object was supposed to be, versus where the tracker actually sees it. */
+export interface DeviationAnchor {
+  objectId: string;
+  expected: [number, number];
+}
+
 interface WorldViewProps {
   objects: ObservedObject[];
   zones: Zone[];
   activePaths?: ActivePath[];
+  deviation?: DeviationAnchor | null;
   selectedObjectId?: string | null;
   onSelectObject?: (id: string | null) => void;
   selectedZoneId?: string | null;
@@ -46,6 +55,7 @@ export function WorldView({
   objects,
   zones,
   activePaths = [],
+  deviation = null,
   selectedObjectId = null,
   onSelectObject,
   selectedZoneId = null,
@@ -141,6 +151,10 @@ export function WorldView({
           ))}
 
           {objects.map((o) => (
+            <Trajectory key={`trail-${o.id}`} object={o} homography={homography} />
+          ))}
+
+          {objects.map((o) => (
             <ObjectAnchor
               key={o.id}
               object={o}
@@ -154,6 +168,14 @@ export function WorldView({
             const from = objectPositionById.get(p.id) ?? p.from;
             return <PathLine key={p.id} from={from} to={p.to} homography={homography} color={p.color} />;
           })}
+
+          {deviation && objectPositionById.has(deviation.objectId) && (
+            <DeviationMarker
+              expected={deviation.expected}
+              actual={objectPositionById.get(deviation.objectId)!}
+              homography={homography}
+            />
+          )}
         </Canvas>
       )}
 

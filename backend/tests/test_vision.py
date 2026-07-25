@@ -8,6 +8,7 @@ import pytest
 
 from app.models import Vec2, Bounds, Zone
 from app.state import HiveState
+from app.vision import bridge
 from app.vision.scene_discovery import (
     Detection,
     SceneDiscovery,
@@ -20,6 +21,18 @@ from app.demo.simulator import Simulator
 
 W, H = 480, 320
 BG = (60, 60, 60)  # low-saturation plain surface
+
+
+@pytest.fixture(autouse=True)
+def isolated_bridge():
+    """These tests build their own HiveState + WorldModel, but `override_active`
+    resolves through the bridge's process-global override map. Without this,
+    an override left behind by another test file suppresses tracking for the
+    same object id here and the failure looks like a tracker bug.
+    """
+    bridge.reset()
+    yield
+    bridge.reset()
 
 
 def make_frame(blobs, size=(W, H), bg=BG):

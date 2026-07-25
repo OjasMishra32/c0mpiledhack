@@ -72,10 +72,16 @@ class WorldModel:
 
         used_indices: set[int] = set()
         for obj in scene.objects:
-            if self.state.override_active(obj.id):
-                continue  # assisted mode wins for the override's TTL
-
             idx = matches.get(obj.id)
+
+            if self.state.override_active(obj.id):
+                # Assisted mode wins for the override's TTL — but the detection it
+                # matched is still *this* object. Consume it, or the unmatched pass
+                # below re-registers the same thing as a phantom new object.
+                if idx is not None:
+                    used_indices.add(idx)
+                continue
+
             if idx is None:
                 obj.visible = False
                 obj.confidence = max(0.0, obj.confidence - MISSING_CONFIDENCE_DECAY)

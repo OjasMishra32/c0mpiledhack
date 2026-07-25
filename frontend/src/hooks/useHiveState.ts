@@ -27,6 +27,9 @@ export interface Deviation {
   observed: string;
   message: string;
   action_ids: string[];
+  /** The object that diverged, when the trigger names one — lets the world view
+   *  anchor an EXPECTED marker to real coordinates instead of parsing prose. */
+  object_id: string | null;
   at: number;
 }
 
@@ -165,6 +168,7 @@ export function useHiveState() {
               observed: payload.observed || '—',
               message: payload.message ?? 'World state deviation detected.',
               action_ids: payload.action_ids ?? [],
+              object_id: payload.object_id ?? null,
               at: Date.now(),
             },
             recovery: null,

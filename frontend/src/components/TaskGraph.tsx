@@ -1,9 +1,10 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
   ReactFlow,
   type Edge,
   type Node,
   type NodeProps,
+  type ReactFlowInstance,
   Handle,
   Position,
 } from '@xyflow/react';
@@ -30,27 +31,57 @@ function objectLabel(o: ObservedObject | undefined): string {
   return o.role ?? o.semantic_label ?? `${o.descriptor.color_name} ${o.descriptor.shape_hint} object`;
 }
 
+const LIVE: ActionStatus[] = ['dispatched', 'acknowledged', 'executing'];
+
 function ActionNode({ data }: NodeProps & { data: ActionNodeData }) {
   const { action, object, worker, selected } = data;
-  const dim = action.status === 'queued';
+  const status = action.status;
+  const live = LIVE.includes(status);
+  const verified = status === 'verified';
+  const failed = status === 'failed' || status === 'blocked';
+  const workerColor = worker?.color ?? 'var(--hive-accent)';
+
+  // Done work recedes; unstarted work is quieter still. Only what is happening
+  // right now is at full strength.
+  const opacity = verified ? 0.7 : status === 'queued' ? 0.5 : 1;
+  const borderColor = selected
+    ? 'var(--hive-accent)'
+    : failed
+      ? 'var(--failure)'
+      : live
+        ? workerColor
+        : 'var(--separator)';
 
   return (
     <div
-      className={`flex w-[200px] flex-col gap-1.5 rounded-control border bg-surface-secondary px-2.5 py-2.5 transition-colors duration-150 ease-standard ${
-        selected ? 'border-accent' : 'border-separator'
+      // Failure is deliberately static. An animated red node reads as a broken
+      // interface rather than a broken plan.
+      className={`flex w-[200px] flex-col gap-1.5 rounded-control border bg-surface-secondary px-2.5 py-2.5 transition-[opacity,border-color] duration-200 ease-standard ${
+        live ? 'node-executing' : ''
       }`}
-      style={{ opacity: dim ? 0.5 : 1 }}
+      style={{
+        opacity,
+        borderColor,
+        ...({ '--node-glow': `${workerColor}66` } as CSSProperties),
+      }}
     >
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
       <div className="flex items-center gap-1.5">
-        <StatusIndicator tone={STATUS_TONE[action.status]} size={6} />
-        <span className="truncate text-[12px] text-text-tertiary">{action.type.replace(/_/g, ' ')}</span>
+        <StatusIndicator tone={STATUS_TONE[status]} size={6} />
+        <span className="truncate text-[12px] text-text-tertiary">{status.replace(/_/g, ' ')}</span>
       </div>
       <div className="truncate text-[13px] text-text-primary">{objectLabel(object) || action.description}</div>
       <div className="flex items-center justify-between text-[12px] text-text-tertiary">
-        <span>{worker?.display_name ?? 'Unassigned'}</span>
-        {action.status === 'verified' && <span>✓</span>}
+        <span className="flex items-center gap-1.5 truncate">
+          {/* Worker identity as colour, readable across the room. */}
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full"
+            style={{ background: worker ? workerColor : 'var(--text-tertiary)' }}
+          />
+          {worker?.display_name ?? 'Unassigned'}
+        </span>
+        {verified && <span style={{ color: 'var(--success)' }}>✓</span>}
       </div>
     </div>
   );
@@ -105,13 +136,54 @@ interface TaskGraphProps {
   onClose?: () => void;
 }
 
+const UNLOCK_MS = 400;
+
 export function TaskGraph({ actions, objects, workers, selectedActionId, onSelectAction, onClose }: TaskGraphProps) {
   const [fullPlan, setFullPlan] = useState(false);
+  const flow = useRef<ReactFlowInstance | null>(null);
+
+  // Edges that a just-verified action feeds. This is the "unlocking" moment —
+  // the single clearest way to show that finishing one thing released the next.
+  const [unlocking, setUnlocking] = useState<Set<string>>(() => new Set());
+  const prevStatus = useRef<Map<string, ActionStatus>>(new Map());
+
+  useEffect(() => {
+    const justVerified = new Set<string>();
+    for (const a of actions) {
+      const before = prevStatus.current.get(a.id);
+      if (before && before !== 'verified' && a.status === 'verified') justVerified.add(a.id);
+      prevStatus.current.set(a.id, a.status);
+    }
+    if (!justVerified.size) return;
+
+    const ids = actions.flatMap((a) =>
+      a.dependencies.filter((dep) => justVerified.has(dep)).map((dep) => `${dep}-${a.id}`),
+    );
+    if (!ids.length) return;
+
+    setUnlocking((prev) => new Set([...prev, ...ids]));
+    const t = window.setTimeout(() => {
+      setUnlocking((prev) => {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        return next;
+      });
+    }, UNLOCK_MS);
+    return () => window.clearTimeout(t);
+  }, [actions]);
 
   const visibleActions = useMemo(
     () => (fullPlan ? actions : compactSubset(actions)),
     [actions, fullPlan],
   );
+
+  // Re-fit only when the operator changes what they asked to see. The view never
+  // moves on its own — a graph that re-centres while someone is pointing at it
+  // is maddening.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => flow.current?.fitView({ padding: 0.2, duration: 200 }));
+    return () => cancelAnimationFrame(id);
+  }, [fullPlan]);
 
   const { nodes, edges } = useMemo(() => {
     const byId = new Map(visibleActions.map((a) => [a.id, a]));
@@ -139,15 +211,22 @@ export function TaskGraph({ actions, objects, workers, selectedActionId, onSelec
       a.dependencies
         .filter((dep) => visibleIds.has(dep))
         .map((dep) => {
+          const id = `${dep}-${a.id}`;
           const broken = byId.get(dep)?.status === 'failed';
           const active = a.status === 'executing' || a.status === 'available';
+          const releasing = unlocking.has(id);
           return {
-            id: `${dep}-${a.id}`,
+            id,
             source: dep,
             target: a.id,
+            className: releasing ? 'edge-unlocking' : undefined,
             style: {
-              stroke: broken ? 'var(--failure)' : 'rgba(255,255,255,0.16)',
-              strokeWidth: active ? 1.5 : 1,
+              stroke: releasing
+                ? 'var(--success)'
+                : broken
+                  ? 'var(--failure)'
+                  : 'rgba(255,255,255,0.16)',
+              strokeWidth: releasing ? 2 : active ? 1.5 : 1,
             },
             type: 'smoothstep',
           };
@@ -155,7 +234,7 @@ export function TaskGraph({ actions, objects, workers, selectedActionId, onSelec
     );
 
     return { nodes, edges };
-  }, [visibleActions, objects, workers, selectedActionId]);
+  }, [visibleActions, objects, workers, selectedActionId, unlocking]);
 
   return (
     <div className="relative h-full w-full bg-background">
@@ -171,7 +250,10 @@ export function TaskGraph({ actions, objects, workers, selectedActionId, onSelec
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
-        fitView
+        onInit={(instance) => {
+          flow.current = instance;
+          instance.fitView({ padding: 0.2 });
+        }}
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable={false}

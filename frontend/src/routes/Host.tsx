@@ -8,7 +8,7 @@ import { Sidebar } from '../components/Sidebar';
 import { TaskGraph } from '../components/TaskGraph';
 import { Timeline } from '../components/Timeline';
 import { Toolbar } from '../components/Toolbar';
-import { WorldView, type ActivePath } from '../components/WorldView';
+import { WorldView, type ActivePath, type DeviationAnchor } from '../components/WorldView';
 import { useHiveState } from '../hooks/useHiveState';
 
 export function Host() {
@@ -52,6 +52,22 @@ export function Host() {
         }),
     [derived.live, state.scene, state.workers],
   );
+
+  // Expected position = the centre of the target zone of the action this deviation
+  // paused. Derived from live state, never from the message text.
+  const deviationAnchor: DeviationAnchor | null = useMemo(() => {
+    const dev = state.deviation;
+    if (!dev?.object_id) return null;
+    const action = state.actions.find(
+      (a) => dev.action_ids.includes(a.id) && a.object_id === dev.object_id && a.target_zone,
+    );
+    const zone = state.scene.zones.find((z) => z.id === action?.target_zone);
+    if (!zone) return null;
+    return {
+      objectId: dev.object_id,
+      expected: [zone.bounds.x + zone.bounds.w / 2, zone.bounds.y + zone.bounds.h / 2],
+    };
+  }, [state.deviation, state.actions, state.scene.zones]);
 
   const metrics = state.metrics;
   const completionStats = useMemo(
@@ -118,6 +134,7 @@ export function Host() {
             objects={state.scene.objects}
             zones={state.scene.zones}
             activePaths={activePaths}
+            deviation={deviationAnchor}
             selectedObjectId={selection?.kind === 'object' ? selection.id : null}
             onSelectObject={(id) => setSelection(id ? { kind: 'object', id } : null)}
             selectedZoneId={selection?.kind === 'zone' ? selection.id : null}
@@ -125,10 +142,13 @@ export function Host() {
           />
 
           {state.deviation && (
+            // Keyed per deviation: a second divergence is a new beat, not a re-render
+            // of the first one.
             <DeviationBanner
+              key={state.deviation.at}
               deviation={state.deviation}
-              phase={state.recovery ? 'reassigning' : 'detected'}
-              recovery={state.recovery ? { summary: state.recovery } : null}
+              recovery={state.recovery}
+              label={state.scenario?.lexicon?.deviation ?? 'World state deviation'}
             />
           )}
 
