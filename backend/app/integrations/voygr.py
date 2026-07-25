@@ -43,7 +43,7 @@ class CallwrightClient:
         await state.emit(
             "call_initiated",
             f"Voice escalation (simulated): {brief.splitlines()[0] if brief else 'brief unavailable'}",
-            severity="warn", simulated=True, to=to,
+            severity="warn", metadata={"simulated": True, "to": to},
         )
         return CallRecord(
             call_id=f"sim_{datetime.now(timezone.utc).timestamp():.0f}",
@@ -90,9 +90,9 @@ client = CallwrightClient()
 def build_brief(trigger, state) -> str:
     """Everything goes in the brief — generated from structured state so it's accurate
     and never hallucinated."""
-    blocked = [a for a in state.actions.values() if a.status.value == "blocked"]
-    missing = [o for o in state.world.objects if o.confidence < 0.25 and not o.held_by]
-    n_available = sum(1 for w in state.workers.values() if w.available and w.connected)
+    blocked = [a for a in state.actions if a.status == "blocked"]
+    missing = [o for o in state.scene.objects if o.confidence < 0.25 and not o.held_by]
+    n_available = sum(1 for w in state.workers if w.available and w.connected)
     n_total = len(state.workers)
     return f"""You are HIVE, an autonomous operations coordinator, placing an automated
 escalation call. Be calm, concise, and factual. Deliver the situation report, then ask
@@ -101,7 +101,7 @@ the recipient to confirm they can respond, then confirm and end the call.
 SITUATION REPORT
 Site: {state.scenario_id}
 Trigger: {trigger.human_readable or trigger.kind}
-Zone status: {", ".join(f"{z.label}: {z.status}" for z in state.world.zones) or "none"}
+Zone status: {", ".join(f"{z.label}: {z.status}" for z in state.scene.zones) or "none"}
 Responders: {n_available} available of {n_total}
 Blocked operations: {", ".join(a.description for a in blocked) or "none"}
 Resources unaccounted for: {", ".join(o.display_label() for o in missing) or "none"}
@@ -150,8 +150,8 @@ def should_escalate(state, trigger=None) -> EscalationDecision | None:
 
     if trigger and trigger.kind == "worker_emergency":
         return EscalationDecision(reason="worker_emergency", to=settings.escalation_phone)
-    critical_zones = [z for z in state.world.zones if z.status == "critical"]
-    if critical_zones and not any(w.available for w in state.workers.values()):
+    critical_zones = [z for z in state.scene.zones if z.status == "critical"]
+    if critical_zones and not any(w.available for w in state.workers):
         return EscalationDecision(reason="zone_critical_no_responder", to=settings.escalation_phone)
     if trigger and trigger.kind == "scheduler_deadlock":
         return EscalationDecision(reason="scheduler_deadlock", to=settings.escalation_phone)
@@ -166,5 +166,5 @@ async def escalate(trigger, state) -> CallRecord | None:
     record = await client.place_call(decision.to, brief, meta={"reason": decision.reason})
     _call_history.append(datetime.now(timezone.utc))
     await state.emit("call_initiated", f"Voice escalation: {decision.reason}", severity="warn",
-                      call_id=record.call_id, to=decision.to)
+                      metadata={"call_id": record.call_id, "to": decision.to})
     return record

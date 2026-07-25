@@ -2,91 +2,115 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project state
+## What this is
 
-This is **HIVE** — "the AI operating system for physical organizations," a hackathon project. As of
-this writing the repo contains only scaffolding: `README.md`, `docs/CONTRACTS.md` (the shared
-data-model/protocol spec — read this first), `docs/SCENARIOS.md`, five per-person handoff docs
-(`Ojas.md`, `Zechariah.md`, `David.md`, `Steven.md`, `Nikki.md`), a `Makefile`, `.env.example`, and
-`backend/requirements.txt`. **`backend/app/` and `frontend/` do not exist yet.** Everything under
-"Architecture" below describes the target design from the docs, not verified-working code — check
-the actual directory tree before assuming a module exists.
+HIVE — "the AI operating system for physical organizations." It observes a physical space through
+a camera, decomposes a high-level objective into a dependency-aware task graph, dispatches private
+instructions to individual humans (phones), verifies what actually happened, detects when reality
+diverges from the plan, and replans in real time without restarting the operation. Built for a
+hackathon demo (live tabletop warehouse scenario + a campus-emergency video scenario).
 
-The per-person docs are prescriptive design specs (code sketches, exact algorithms, data flows, even
-UI copy) for each owner's area, not just handoff notes. Read the relevant one before implementing in
-that area.
+**Current state: pre-implementation.** Only docs, `Makefile`, `.env.example`, and
+`backend/requirements.txt` exist. `backend/app/` and `frontend/` have not been created yet — the
+`Makefile` targets and repository layout described below are the *spec*, not yet reality. Check
+what actually exists before assuming a file is there.
+
+## Read these first, in order
+
+1. `docs/CONTRACTS.md` — **the spine.** Every Pydantic model, every enum, the full WebSocket
+   protocol, and the five non-negotiable rules. Backend (`backend/app/models.py`) and frontend
+   (`frontend/src/types/hive.ts`) must stay structurally identical to it — `snake_case` on both
+   sides, no camelCase on the frontend. If you change a shared type, this file changes first.
+2. `docs/SCENARIOS.md` — what a scenario is (starting conditions + framing, never a hardcoded
+   object list) and the specific scenarios (`warehouse_fulfillment` is the flagship live demo).
+3. Your workstream's own handoff doc (`Ojas.md`, `Zechariah.md`, `David.md`, `Steven.md`,
+   `Nikki.md`) — hour-by-hour build plan and file-level implementation guidance for that area.
 
 ## Commands
 
+```bash
+make install   # backend venv (backend/.venv) + pip install -r backend/requirements.txt + frontend npm install
+make dev       # backend :8000 (uvicorn --reload) + frontend :5173, prints LAN join URL
+make demo      # make dev with DEMO_MODE=true WORLD_MODE=simulation (no camera/keys/phones needed)
+make test      # pytest backend/tests -q  +  npm run test --if-present (frontend)
+make ip        # prints the phone join URL for the QR code
 ```
-make install   # backend venv (backend/.venv) + frontend npm install; copies .env.example -> .env
-make dev       # backend :8000 (uvicorn --reload) + frontend :5173 (vite) via `make -j2`
-make demo      # `make dev` with DEMO_MODE=true WORLD_MODE=simulation — no camera/keys/phones needed
-make test      # backend/.venv/bin/pytest backend/tests -q ; cd frontend && npm run test --if-present
-make ip        # prints the LAN join URL for phones (http://<lan-ip>:5173/join)
-make clean     # removes backend/.venv, frontend/node_modules, frontend/dist
+
+Single test: `backend/.venv/bin/pytest backend/tests/test_e2e_flagship.py -q` (this end-to-end test
+is the canonical "does the whole flagship demo still work headless" check, once it exists).
+
+`cp .env.example .env` before running — every env var has a working default; none are required to
+boot. `NVIDIA_API_KEY` is the only one that unlocks the LLM planner and VLM perception; without it
+the system still runs on the template planner and CV-only perception.
+
+## Architecture (target shape, per README)
+
+```
+camera → Perception (OpenCV tracker @10Hz for position/zone/identity,
+                      NVIDIA NIM VLM @~1.4Hz for semantics: held_by, stacked_on, activity)
+       → Grounding (binds plain-language phrases like "the scanner" to discovered object ids)
+       → AI task compiler (planner/: LLM planner, falls back silently to template_planner)
+       → Graph validator (cycles, unknown ids, unreachable actions, unsafe parallelism)
+       → Capability-aware scheduler + locks (distance, workload, reachability, fairness)
+       → Orchestrator loop (4Hz state machine) ⇄ private worker clients (phones)
+       → Weighted verification + deviation detection + recovery engine (isolate, don't restart)
+       → Voygr voice escalation (only when a zone is critical and no responder is reassignable)
 ```
 
-Single backend test: `backend/.venv/bin/pytest backend/tests/test_x.py::test_name -q`
+Planned repository layout:
 
-Copy `.env.example` to `.env`. Every variable has a working default — nothing is required to run.
-The system must work with **no API key, no camera, and no phones** (`make demo` is the proof of
-this); never write a code path whose happy case assumes any of those three are present.
+```
+backend/app/
+├── main.py config.py models.py state.py websocket_manager.py
+├── orchestrator.py scheduler.py verifier.py recovery.py
+├── planner/     base.py llm_planner.py template_planner.py validator.py prompts.py
+├── vision/      camera.py color_tracker.py world_model.py calibration.py
+├── integrations/voygr.py
+└── demo/        scenarios.py simulator.py
+frontend/src/
+├── routes/      Host.tsx Join.tsx Worker.tsx
+├── components/  TaskGraph WorldView WorkerGrid EventTimeline AdvancedControls …
+├── hooks/       useHiveSocket useSpeech useHaptics
+└── types/hive.ts
+```
 
-## Architecture (target design — full spec in `docs/CONTRACTS.md`)
+### Design principles that shape every file
 
-Pipeline: camera → CV tracker (10Hz, Steven) + VLM over NVIDIA NIM (~1.4Hz, Ojas) → `fusion.py` →
-grounding (binds language like "the scanner" to a live observed object id, Zechariah) → planner
-(LLM with template-planner fallback) → validator (networkx cycle/reachability checks, auto-repair) →
-capability-aware scheduler + resource locks → orchestrator tick (4Hz, single writer) → dispatch to
-private worker phones (Nikki) → vision/worker-report verification (weighted evidence fusion) →
-deviation detection → recovery (isolate the affected branch, never restart the whole plan) →
-optional Voygr voice escalation as a last resort.
+- **Nothing about objects/zones is hardcoded.** Vision discovers what's on the table; grounding
+  binds task language to observed ids at runtime. No object manifest, no color→meaning table.
+- **The LLM thinks occasionally** (goal → plan, hard recovery calls). **Deterministic code controls
+  continuously** (scheduling, verification, the state machine, dispatch). No LLM in the inner loop.
+- **Only `orchestrator.py` mutates `Action.status`.** Scheduler/verifier/route handlers return
+  decisions; the orchestrator applies them. Prevents concurrent mutation bugs.
+- **A scenario is data, not code** (`backend/app/demo/scenarios.py`) — a suggested objective
+  string, zone labels, worker roles, a lexicon for UI copy, and an optional "known-good graph"
+  parachute built over live ids at load time, never stored with literal ids.
+- **Verification is evidence-weighted**, `score = Σ(evidence.confidence × evidence.weight)`,
+  threshold `0.70` (see `docs/CONTRACTS.md` §Evidence for the weight table). `vision` and `vlm` are
+  independent sensors that can co-verify a predicate without a human.
+- **Workers receive only their own `instruction_created`** — never the full action list, goal
+  text, or another worker's instruction. Enforced on both client and server.
 
-### Non-negotiable invariants (`docs/CONTRACTS.md` §5) — hold any change to these
-1. No blocking calls in the event loop — camera reads, LLM calls, Voygr HTTP all go through
+### Non-negotiables (docs/CONTRACTS.md §5)
+
+1. No blocking calls in the event loop — OpenCV, LLM requests, Voygr HTTP all go through
    `asyncio.to_thread` or an async client with a timeout.
-2. Every external call has a timeout and a fallback: LLM → template planner, camera → simulation
-   mode, Voygr → a logged event that still renders in the UI.
-3. The full flagship demo must complete with zero API key, zero camera, zero phones.
-4. The orchestrator tick never raises out of itself — wrap, log, emit a `warn` event, keep ticking.
-5. `host_reset` fully rebuilds state from the scenario without dropping sockets.
+2. Every external call has a timeout and a fallback (LLM→template planner, camera→simulation,
+   Voygr→logged event).
+3. The full flagship demo must complete with no API key, no camera, and no phones (`DEMO_MODE=true`
+   + simulation mode + simulated workers).
+4. Never `raise` out of the orchestrator tick — wrap it, log it, emit a `warn` event, keep ticking.
+5. `host_reset` must rebuild state from the scenario completely while keeping sockets alive.
 
-### Core data model
-- Backend source of truth: `backend/app/models.py` (Pydantic). Frontend source of truth:
-  `frontend/src/types/hive.ts`. **These two must stay structurally identical** — snake_case field
-  names on both sides, no camelCase mapping layer. Changing either (or `docs/CONTRACTS.md` itself)
-  requires whole-team agreement, per the doc's own rule.
-- **Nothing about objects or zones is hardcoded.** Objects are discovered generically from measured
-  HSV/shape descriptors — never a preset color→meaning table (`OBJECT_COLORS = {...}` is the bug to
-  watch for). Zones are auto-detected, drawn, or named from the objective at runtime, never a
-  module-level constant list.
-- `Action.status` is mutated **only** by `orchestrator.py`; the scheduler, verifier, and planner
-  return decisions and the orchestrator applies them.
-- Event `seq` is assigned in exactly one place, `state.emit()`, under a single lock — this is what
-  keeps the timeline gap-free and consistently orderable across clients (sort by `seq`, never by
-  timestamp).
-- `Action.lock_targets` are opaque strings (`object:obj_3`, `zone:zone_2`); two actions whose
-  `lock_targets` intersect may never be dispatched in the same tick. This is the entire
-  concurrency-safety model, deliberately simple so it can't break on stage.
+### Ownership
 
-### Orchestrator tick order — fixed, do not reorder (`backend/app/orchestrator.py`)
-`drain_inbox → world_model.refresh → verifier.evaluate → complete_actions → unlock_dependents →
-detect_deviations → detect_timeouts → run_recovery → assign_actions → dispatch → check_goal →
-flush_broadcasts`
-
-### WebSocket protocol
-One endpoint: `GET /ws?role=host|worker&token=<uuid>`. Workers receive **only their own**
-`instruction_created` message — never the goal text, the action list, or another worker's
-instruction (enforced on both client and server). This is the entire "private instructions" premise
-of the product; a worker who can infer the plan breaks it. Full message catalog: `docs/CONTRACTS.md`
-§3.
-
-### Ownership map
-| Area | Owner | Primary files |
+| Area | Owner | Files |
 |---|---|---|
-| Backend core, state, WS, orchestrator, VLM perception | Ojas | `backend/app/{main,config,models,state,websocket_manager,orchestrator}.py`, `backend/app/perception/*` |
-| Planner (LLM + template + validator), scheduler | Zechariah | `backend/app/planner/*`, `backend/app/scheduler.py` |
-| Host command center UI, design system, DAG | David | `frontend/src/routes/Host.tsx`, `frontend/src/components/*` |
-| Vision, world model, calibration, simulation | Steven | `backend/app/vision/*`, `backend/app/demo/simulator.py`, `frontend/src/components/WorldView.tsx` |
-| Worker PWA, verification + recovery, Voygr voice escalation | Nikki | `frontend/src/routes/{Join,Worker}.tsx`, `backend/app/{verifier,recovery}.py`, `backend/app/integrations/voygr.py` |
+| Backend core, state, WS, orchestrator, integration | Ojas | `backend/app/{main,config,models,state,websocket_manager,orchestrator}.py` |
+| Planner (LLM+template+validator), scheduler | Zechariah | `backend/app/planner/*`, `backend/app/scheduler.py` |
+| Host command center UI, design system, DAG, timeline | David | `frontend/src/routes/Host.tsx`, `frontend/src/components/*` |
+| Vision, world model, AR overlay, calibration, simulation | Steven | `backend/app/vision/*`, `backend/app/demo/simulator.py`, `frontend/src/components/WorldView.tsx` |
+| Worker PWA, verification + recovery, Voygr calls | Nikki | `frontend/src/routes/{Join,Worker}.tsx`, `backend/app/{verifier,recovery}.py`, `backend/app/integrations/voygr.py` |
+
+You own your files; changes to `models.py` / `hive.ts` / `docs/CONTRACTS.md` need the whole team's
+sign-off since four other people's code depends on them staying in sync.
