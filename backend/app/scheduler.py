@@ -5,9 +5,12 @@ Two things matter here, in this order:
 1. **Assignments must be defensibly correct** — hard filters no scoring can override, and a
    deliberately dumb lock model that cannot break on stage.
 2. **The explanation must read as reasoning.** The string this file generates is the most
-   quoted thing on the screen, so it names the top contributing factors *and* says why not the
-   runner-up. It is generated from explicit scoring factors, not from model chain-of-thought,
-   which is exactly what we can honestly claim.
+   quoted thing on the screen, so it names the top contributing factors *and* always says why
+   not somebody else — an explanation that says what but never why-not is half an explanation.
+   When only one worker is viable the counterfactual falls back to the blocked worker who came
+   closest, because "nobody else could reach it" is itself the reasoning. It is generated from
+   explicit scoring factors, not from model chain-of-thought, which is exactly what we can
+   honestly claim.
 
 Weights are tuned for legibility, not optimality: the opening wave should visibly use several
 different workers. If two workers get everything, an audience reads it as a script.
@@ -43,6 +46,32 @@ W_COLLISION = 2.5
 W_FAIRNESS = 0.8
 W_RISK = 2.0
 
+# Same weights, keyed by factor name and ordered heaviest-first. Used to answer "which factor
+# actually decided this?" when naming a counterfactual, so the sentence blames the factor that
+# moved the decision rather than the first one that happens to differ. Insertion order is the
+# tie-break, which keeps the wording identical across hash seeds.
+FACTOR_WEIGHTS: dict[str, float] = {
+    "capability_penalty": W_CAPABILITY,
+    "collision_penalty": W_COLLISION,
+    "distance_cost": W_DISTANCE,
+    "risk_penalty": W_RISK,
+    "workload_penalty": W_WORKLOAD,
+    "reachability_penalty": W_REACHABILITY,
+    "fairness_penalty": W_FAIRNESS,
+}
+
+# How close a *blocked* worker came to being usable, lowest first. Momentary blockers rank ahead
+# of structural ones (they'd have been fine a moment later), and a worker who never showed up
+# ranks last — someone offline is the least interesting alternative to name on screen.
+BLOCK_PROXIMITY: dict[str, int] = {
+    "hands_full": 0,
+    "lock": 1,
+    "reach_object": 2,
+    "reach_target": 2,
+    "capability": 3,
+    "unavailable": 4,
+}
+
 LIVE_STATUSES = {
     ActionStatus.assigned.value,
     ActionStatus.dispatched.value,
@@ -77,7 +106,7 @@ class Assignment:
     callsign: str = ""
     score: float = 0.0
     reason: str = ""  # one sentence, shown in the UI
-    reason_short: str = ""  # used inside another assignment's counterfactual
+    reason_short: str = ""  # used inside another assignment's counterfactual, and by describe_block
     factors: dict[str, float] = field(default_factory=dict)  # the receipts, shown on hover
     viable: bool = True
     blocked_by: str = ""
@@ -104,6 +133,21 @@ def _label(action: Action, scene: Scene) -> str:
     if action.target_zone:
         return scene.zone_label(action.target_zone)
     return "this step"
+
+
+def _zone_phrase(action: Action, scene: Scene) -> str:
+    """The place this action is *about*, by its label — never a generic "that zone".
+
+    Returns "" when there is no named zone, and callers drop the clause rather than print a
+    vague one. The open floor is not a place you can be conflicted in, so it doesn't count.
+    """
+    obj = _object_of(action, scene)
+    for zone_id in (action.target_zone, obj.zone if obj is not None else None):
+        if zone_id and zone_id != "field":
+            label = scene.zone_label(zone_id)
+            if label and label != zone_id:
+                return label
+    return ""
 
 
 def _distance(worker: Worker, action: Action, scene: Scene) -> float:
@@ -225,10 +269,23 @@ def score_workers(action: Action, state: SchedulerState) -> list[Assignment]:
 
     out.sort(key=lambda c: (not c.viable, c.score))
     viable = [c for c in out if c.viable]
+    blocked_alternative = _strongest_blocked(out)
     for i, cand in enumerate(viable):
-        runner_up = viable[i + 1] if i + 1 < len(viable) else None
-        cand.reason = explain(action, cand, runner_up, cand.factors, scene)
+        # Every explanation gets a counterfactual, in order of how much of an alternative the
+        # other worker really was: the next viable candidate, else the blocked worker who came
+        # closest (the common "only one person can reach that zone" case), else the strongest
+        # candidate ahead of this one. Only a roster of exactly one has nobody to name.
+        alternative = viable[i + 1] if i + 1 < len(viable) else (blocked_alternative or (viable[0] if i else None))
+        cand.reason = explain(action, cand, alternative, cand.factors, scene)
     return out
+
+
+def _strongest_blocked(candidates: list[Assignment]) -> Assignment | None:
+    """The blocked worker who came closest to being usable — the fallback counterfactual."""
+    blocked = [c for c in candidates if not c.viable]
+    if not blocked:
+        return None
+    return min(blocked, key=lambda c: (BLOCK_PROXIMITY.get(c.blocked_by, len(BLOCK_PROXIMITY)), c.callsign))
 
 
 def _reason_short(cand: Assignment, action: Action, scene: Scene) -> str:
@@ -236,7 +293,8 @@ def _reason_short(cand: Assignment, action: Action, scene: Scene) -> str:
     if f.get("workload_penalty"):
         return "already on another task"
     if f.get("collision_penalty"):
-        return f"working in {scene.zone_label(action.target_zone) if action.target_zone else 'that area'} already"
+        zone = _zone_phrase(action, scene)  # named, or not mentioned at all — never "that area"
+        return f"working in {zone} already" if zone else "working in the same place already"
     if f.get("risk_penalty", 0) > 0.1:
         return "still recovering from a failed step"
     if f.get("distance_cost", 0) > 0.5:
@@ -246,6 +304,62 @@ def _reason_short(cand: Assignment, action: Action, scene: Scene) -> str:
     return "a close second"
 
 
+def _factor_phrase(key: str, action: Action, scene: Scene) -> str:
+    """How the *loser* of one factor reads in a sentence. "" when it can't be said precisely."""
+    if key == "distance_cost":
+        return f"further from {_label(action, scene)}"
+    if key == "workload_penalty":
+        return "mid-task"
+    if key == "risk_penalty":
+        return "still recovering from a failed step"
+    if key == "fairness_penalty":
+        return "carrying more of the load already"
+    if key == "capability_penalty":
+        return "cleared for fewer kinds of work"
+    zone = _zone_phrase(action, scene)  # the rest only mean something with a place to name
+    if not zone:
+        return ""
+    if key == "reachability_penalty":
+        return f"not in {zone} yet"
+    if key == "collision_penalty":
+        return f"already busy in {zone}"
+    return ""
+
+
+def _losing_factors(winner: dict[str, float], other: dict[str, float]) -> list[str]:
+    """Factors the other candidate lost on, worst weighted gap first."""
+    gaps = []
+    for i, (key, weight) in enumerate(FACTOR_WEIGHTS.items()):
+        gap = weight * (other.get(key, 0.0) - winner.get(key, 0.0))
+        if gap > 1e-9:
+            gaps.append((-gap, i, key))
+    return [key for _, _, key in sorted(gaps)]
+
+
+def _why_not(action: Action, winner: Assignment, other: Assignment | None, scene: Scene) -> str:
+    """The counterfactual half of every explanation. Never empty, and never invents a worker."""
+    if other is None:
+        return "No other responder was available."
+    if not other.viable:
+        # Blocked workers already carry the reason they were excluded; just make it a sentence.
+        if not other.reason_short:
+            return f"{other.callsign} was not an option this cycle."
+        if other.blocked_by in ("capability", "reach_object", "reach_target"):
+            return f"{other.callsign} {other.reason_short}."  # already reads as a verb phrase
+        if other.blocked_by == "lock":
+            return f"{other.callsign} could not start while {other.reason_short}."
+        return f"{other.callsign} was {other.reason_short}."
+    if other.score < winner.score - 1e-9:
+        # Naming someone who actually scored better only happens for a fallback pick; say so
+        # plainly rather than inventing a fault they don't have.
+        return f"{other.callsign} was the stronger option overall."
+    for key in _losing_factors(winner.factors, other.factors):
+        phrase = _factor_phrase(key, action, scene)
+        if phrase:
+            return f"{other.callsign} was {phrase}."
+    return f"{other.callsign} scored identically and lost the tie-break."
+
+
 def explain(
     action: Action,
     winner: Assignment,
@@ -253,25 +367,36 @@ def explain(
     factors: dict[str, float],
     scene: Scene,
 ) -> str:
-    """Generated from the top contributing factors — never generic, always with a counterfactual."""
+    """One sentence of positive factors, then always a counterfactual.
+
+    `runner_up` is whichever worker was the strongest alternative — usually the next viable
+    candidate, but a *blocked* one when nobody else was viable, in which case the sentence says
+    what excluded them. Zones are named by their label; at most three factors, so it stays
+    quotable; and the positive half is never generic, because a hard filter this worker cleared
+    is more informative than the word "selected" on its own.
+    """
     label = _label(action, scene)
+    zone = _zone_phrase(action, scene)
     bits: list[str] = []
     if factors.get("distance_cost", 1.0) < 0.25:
-        bits.append(f"closest responder to {label}")
+        bits.append(f"closest to {label}")
     if not factors.get("workload_penalty"):
         bits.append("currently idle")
-    if not factors.get("reachability_penalty"):
-        bits.append("already standing in that area")
-    if not factors.get("collision_penalty") and action.target_zone:
-        bits.append("no conflicting activity in that zone")
+    standing = not factors.get("reachability_penalty") and bool(zone)
+    if standing:
+        bits.append(f"already standing in {zone}")
+    if not factors.get("collision_penalty") and action.target_zone and zone:
+        # "there" is only ever used after the zone has just been named, so it always has one.
+        bits.append("no conflicting activity there" if standing else f"no conflicting activity in {zone}")
     if factors.get("fairness_penalty", 1.0) < 0.2:
         bits.append("lowest current workload")
     if not factors.get("risk_penalty"):
         bits.append("no recent failures")
     if not bits:
-        bits.append(f"the only viable responder for {label}")
-    why_not = f" {runner_up.callsign} was {runner_up.reason_short}." if runner_up else ""
-    return f"{winner.callsign} selected: {', '.join(bits[:3])}.{why_not}"
+        # Nothing scored well. Fall back to the hard filters they *did* clear — honest, specific,
+        # and it still tells the room why this assignment is legal.
+        bits.append(f"hands free and cleared to work in {zone}" if zone else "hands free and cleared for this step")
+    return f"{winner.callsign} selected: {', '.join(bits[:3])}. {_why_not(action, winner, runner_up, scene)}"
 
 
 # ── blocking explanations ──────────────────────────────────────────────────────

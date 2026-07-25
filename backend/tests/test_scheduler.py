@@ -42,6 +42,15 @@ def _move(aid, object_id, zone, priority=70, **kw) -> Action:
     )
 
 
+def _counterfactual(reason: str) -> str:
+    """The "why not the other one" half of an explanation: everything after the first sentence."""
+    return reason.partition(". ")[2]
+
+
+def _others(state, callsign: str) -> list[str]:
+    return [w.callsign for w in state.workers if w.callsign != callsign]
+
+
 def _simple_state(actions=None):
     scene = make_scene(
         [
@@ -178,9 +187,124 @@ def test_explanation_names_the_runner_up():
     state = _simple_state([_move("a1", "obj_1", "zone_2")])
     winner = best_worker(state.actions[0], state)
     others = [c for c in score_workers(state.actions[0], state) if c.viable]
-    if len(others) > 1:
-        assert others[1].callsign in winner.reason
-        assert winner.reason.rstrip().endswith(".")
+    assert len(others) > 1  # the fixture has five workers; a vacuous pass would hide a regression
+    assert others[1].callsign in winner.reason
+    assert winner.reason.rstrip().endswith(".")
+
+
+def test_single_viable_worker_still_gets_a_counterfactual():
+    """A zone only one person can reach is the case that most needs explaining, so it is exactly
+    the wrong moment for the explanation to go quiet."""
+    state = _simple_state([_move("a1", "obj_1", "zone_2")])
+    for w in state.workers:
+        w.reachable_zones = ["zone_1", "zone_3", "field"]  # nobody reaches the Pack Station...
+    state.worker_by_id("worker_d").reachable_zones = ["zone_2", "zone_4", "field"]  # ...except DELTA
+    candidates = score_workers(state.actions[0], state)
+    viable = [c for c in candidates if c.viable]
+    assert [c.callsign for c in viable] == ["DELTA"]  # genuinely one option
+
+    tail = _counterfactual(viable[0].reason)
+    assert tail, viable[0].reason  # a counterfactual is not optional
+    assert any(cs in tail for cs in _others(state, "DELTA")), tail
+    assert "Pack Station" in tail  # and it says what excluded them
+
+
+def test_counterfactual_falls_back_to_why_a_blocked_worker_was_excluded():
+    """With no viable runner-up, borrow the strongest blocked candidate's own exclusion reason."""
+    state = _simple_state([_move("a1", "obj_1", "zone_2")])
+    for w in state.workers:
+        w.reachable_zones = ["zone_1", "zone_3", "field"]
+    for wid in ("worker_c", "worker_d"):
+        state.worker_by_id(wid).reachable_zones = ["zone_1", "zone_2", "zone_3", "zone_4", "field"]
+    state.scene.by_id("obj_2").held_by = "worker_d"  # DELTA could reach it, but has full hands
+
+    winner = best_worker(state.actions[0], state)
+    assert winner.callsign == "CHARLIE"
+    # A momentary blocker outranks the four who structurally cannot reach the zone.
+    assert _counterfactual(winner.reason) == "DELTA was already holding something else."
+
+
+def test_every_assignment_in_a_batch_ends_by_naming_a_different_worker():
+    state = _simple_state(
+        [_move("a1", "obj_1", "zone_2"), _move("a2", "obj_2", "zone_4"), _move("a3", "obj_3", "zone_1")]
+    )
+    batch = select_batch(state)
+    assert len(batch) == 3
+    for _, assignment in batch:
+        tail = _counterfactual(assignment.reason)
+        assert tail.endswith("."), assignment.reason
+        named = [cs for cs in _others(state, assignment.callsign) if cs in tail]
+        assert named, assignment.reason  # somebody else, by name
+        assert assignment.callsign not in tail  # and never the assignee talking about themselves
+
+
+def test_every_viable_candidate_carries_its_own_counterfactual():
+    """orchestrator._apply_attribution can promote any viable candidate and keep its reason
+    string, so a counterfactual on the top-scorer alone is not enough."""
+    state = _simple_state([_move("a1", "obj_1", "zone_2")])
+    viable = [c for c in score_workers(state.actions[0], state) if c.viable]
+    assert len(viable) == 5
+    for cand in viable:
+        tail = _counterfactual(cand.reason)
+        assert tail.endswith("."), cand.reason
+        assert any(cs in tail for cs in _others(state, cand.callsign)), cand.reason
+
+
+def test_a_lone_responder_is_not_given_an_imaginary_rival():
+    """Nobody else on the floor is an honest answer. Inventing a runner-up is a lie on stage."""
+    scene = make_scene([make_object("obj_1", "red", 0.30, 0.45)])
+    state = make_state(scene, make_workers(1), [_move("a1", "obj_1", "zone_2")])
+    winner = best_worker(state.actions[0], state)
+    assert _counterfactual(winner.reason) == "No other responder was available."
+
+
+def test_explanation_names_the_zone_not_a_vague_area():
+    state = _simple_state([_move("a1", "obj_1", "zone_2")])
+    batch = select_batch(state)
+    assert batch
+    for _, assignment in batch:
+        assert "Pack Station" in assignment.reason
+        assert "that zone" not in assignment.reason
+        assert "that area" not in assignment.reason
+        assert "zone_" not in assignment.reason  # labels, never ids
+        if "activity there" in assignment.reason:
+            # "there" is only allowed once the zone has already been named out loud, and the
+            # three-factor trim must never drop the clause that named it.
+            assert "already standing in" in assignment.reason.split("activity there")[0], assignment.reason
+
+
+def test_a_forced_pick_still_explains_itself_specifically():
+    """When every soft factor is against the only available worker, the explanation falls back to
+    the hard filters they *did* clear — never a bare "selected"."""
+    busy = _move("a0", "obj_2", "zone_2")
+    busy.status = ActionStatus.dispatched.value  # so the Pack Station counts as contended
+    state = _simple_state([busy, _move("a1", "obj_1", "zone_2")])
+    for w in state.workers:
+        w.reachable_zones = ["zone_1", "zone_3", "field"]
+    only = state.worker_by_id("worker_d")
+    only.reachable_zones = ["zone_2", "zone_4", "field"]
+    only.position.x, only.position.y = 0.05, 0.95  # far away
+    only.current_action_id = "a9"  # busy
+    only.confidence = 0.5  # shaky
+    only.assignment_count = 9  # and carrying every prior assignment
+
+    winner = best_worker(state.actions[1], state)
+    assert winner.callsign == "DELTA"
+    head, _, tail = winner.reason.partition(". ")
+    assert "Pack Station" in head, winner.reason  # specific, not "selected because reasons"
+    assert len(head.split()) >= 5, winner.reason
+    assert any(cs in tail for cs in _others(state, "DELTA")), winner.reason
+
+
+def test_explanation_stays_quotable():
+    """One sentence of factors, at most three of them, then exactly one counterfactual sentence."""
+    state = _simple_state([_move("a1", "obj_1", "zone_2")])
+    for cand in score_workers(state.actions[0], state):
+        if not cand.viable:
+            continue
+        head, _, tail = cand.reason.partition(". ")
+        assert head.count(",") <= 2, cand.reason
+        assert tail.count(".") == 1, cand.reason
 
 
 def test_blocked_reason_explains_the_wait_in_plain_language():
