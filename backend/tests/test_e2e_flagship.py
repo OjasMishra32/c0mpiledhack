@@ -10,12 +10,15 @@ import pytest
 
 from app.host_commands import HOST_HANDLERS as H
 
-from .conftest import complete, drive_to_completion, run_ticks
+from .conftest import complete, drive_to_completion, run_ticks, stage_on_the_floor
 
 pytestmark = pytest.mark.asyncio
 
 
 async def test_flagship_completes_with_worker_failure(state):
+    # The wave below is only observable if no delivery starts already satisfied — a random
+    # spawn inside its own target zone verifies in one tick, correctly. See the helper.
+    stage_on_the_floor(state)
     goal = state.scenario.build_goal(state.scene)
     await H["host_compile_goal"]({"text": goal})
 
