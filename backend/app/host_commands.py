@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from .config import settings
@@ -195,12 +196,30 @@ async def h_start(p: dict[str, Any]) -> None:
 
 
 async def h_pause(p: dict[str, Any]) -> None:
+    # Timeouts are measured against the wall clock, so paused time would otherwise count
+    # against every in-flight action. Pause for longer than the action timeout and the
+    # instant you resume, every phone re-speaks and the screen fills with red banners —
+    # exactly when the presenter has just started talking again.
+    state.paused_at = time.monotonic()
     state.execution_status = "paused"
     await ws.broadcast("execution_paused", {})
     await state.emit("execution_paused", "All activity paused. Workers standing by.", severity="warn")
 
 
 async def h_resume(p: dict[str, Any]) -> None:
+    paused_for = time.monotonic() - (state.paused_at or time.monotonic())
+    if paused_for > 0.5:
+        from datetime import datetime, timedelta
+
+        for a in state.actions.values():
+            if a.status in ("dispatched", "acknowledged", "executing") and a.dispatched_at:
+                try:
+                    a.dispatched_at = (
+                        datetime.fromisoformat(a.dispatched_at) + timedelta(seconds=paused_for)
+                    ).isoformat()
+                except Exception:
+                    pass
+    state.paused_at = None
     state.execution_status = "executing"
     await ws.broadcast("execution_resumed", {})
     await state.emit("execution_resumed", "Execution resumed.", severity="success")

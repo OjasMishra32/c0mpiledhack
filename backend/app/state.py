@@ -78,6 +78,7 @@ class HiveState:
         self.escalation_armed: bool = False
         self.last_call: dict[str, Any] | None = None
         self.host_overrides: dict[str, Any] = {}
+        self.paused_at: float | None = None
         self._seq = 0
         self._lock = asyncio.Lock()
         self._started_monotonic: float | None = None
@@ -237,6 +238,7 @@ class HiveState:
         self.execution_status = "idle"
         self.metrics = RunMetrics()
         self.pending_grounding = None
+        self.paused_at = None
         self._started_monotonic = None
         self._apply_scenario(scenario)
 

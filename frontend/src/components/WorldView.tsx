@@ -62,6 +62,7 @@ export function WorldView({
   onSelectZone,
 }: WorldViewProps) {
   const { videoRef, status } = useCameraStream();
+  const [feedLive, setFeedLive] = useState(false);
   const [webglAvailable] = useState(detectWebGL);
   const [calibrating, setCalibrating] = useState(false);
   const [calibrationPoints, setCalibrationPoints] = useState<Point[]>([]);
@@ -117,6 +118,16 @@ export function WorldView({
   return (
     <div className="relative h-full w-full overflow-hidden bg-background">
       <video ref={videoRef} muted playsInline className="hidden" />
+
+      {/* The backend's decoded feed — the same frames the tracker sees. */}
+      <img
+        src="/api/vision/frame.mjpg"
+        alt=""
+        aria-hidden
+        onLoad={() => setFeedLive(true)}
+        onError={() => setFeedLive(false)}
+        className="pointer-events-none absolute inset-0 h-full w-full object-cover opacity-90"
+      />
 
       {!webglAvailable ? (
         <Fallback2D
@@ -192,7 +203,7 @@ export function WorldView({
         />
       )}
 
-      {status === 'denied' || status === 'unavailable' ? (
+      {!feedLive && (status === 'denied' || status === 'unavailable') ? (
         <div className="pointer-events-none absolute left-4 top-4 text-[12px] text-text-tertiary">
           Simulation — camera unavailable
         </div>

@@ -411,3 +411,25 @@ async def test_events_never_reach_worker_sockets(state):
             f"{mod.__name__} fans events out to every phone — a judge with devtools open "
             "could read the whole plan"
         )
+
+
+async def test_pause_does_not_count_against_action_timeouts(state):
+    """Pause for longer than the action timeout and, the instant you resume, every phone
+    re-speaks and the screen fills with red banners — right as the presenter starts
+    talking again. Paused time must not count against in-flight actions."""
+    import time as _t
+
+    await H["host_compile_goal"]({"text": state.scenario.build_goal(state.scene)})
+    await H["host_start_execution"]({})
+    await run_ticks(3)
+
+    live = [a for a in state.actions.values() if a.status in ("dispatched", "acknowledged")]
+    assert live, "need in-flight actions to pause"
+
+    await H["host_pause_all"]({})
+    state.paused_at = _t.monotonic() - 60  # simulate a long pause
+    before = state.metrics.deviations
+    await H["host_resume_all"]({})
+    await run_ticks(3)
+
+    assert state.metrics.deviations == before, "a long pause must not fire timeout deviations"
