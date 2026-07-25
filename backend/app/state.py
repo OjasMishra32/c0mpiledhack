@@ -243,13 +243,14 @@ class HiveState:
         # Reset must be TOTAL. Every module that keeps state between ticks gets cleared,
         # or a second run inherits the first one's debounce counters, locks and overrides.
         # We press this button a dozen times during a demo.
-        from . import recovery, scheduler
+        from . import orchestrator, recovery, scheduler
         from .attribution import attribution
         from .integrations import voygr
         from .vision import bridge
 
         bridge.reset()
         recovery.reset()
+        orchestrator.reset_adjudication()
         attribution.reset()
         voygr.reset_cooldown()
         with contextlib.suppress(Exception):

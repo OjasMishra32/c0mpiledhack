@@ -324,3 +324,61 @@ async def test_one_worker_never_holds_two_live_actions(state):
             if a.status in ("dispatched", "acknowledged", "executing"):
                 complete(a.id)
         await run_ticks(2)
+
+
+# ── deviation adjudication ──────────────────────────────────────────────────
+
+
+async def test_adjudication_fails_open_when_unavailable(state):
+    """No camera or no model means the tracker's word stands. A missing reasoner must
+    never be able to swallow a real deviation."""
+    from app import orchestrator
+
+    orchestrator.reset_adjudication()
+    await H["host_compile_goal"]({"text": state.scenario.build_goal(state.scene)})
+    await H["host_start_execution"]({})
+    await run_ticks(2)
+    for a in list(state.actions.values()):
+        if a.status in ("dispatched", "acknowledged", "executing"):
+            complete(a.id)
+    await run_ticks(4)
+
+    await H["host_inject_failure"]({"kind": "verification_regress"})
+    await run_ticks(6)
+    assert state.metrics.deviations >= 1, "deviation must fire with no reasoner available"
+
+
+async def test_adjudication_suppresses_a_refuted_deviation(state):
+    """When the scene model reviews the footage and disagrees, HIVE declines to cry wolf."""
+    from app import orchestrator
+    from app.perception.analyzer import Analysis
+
+    orchestrator.reset_adjudication()
+
+    class FakeTrigger:
+        kind = "left_target_zone"
+        object_id = "obj_1"
+        worker_id = None
+        action_ids: list[str] = []
+        expected = "obj_1 in Pack Station"
+        observed = "obj_1 in Pick Aisle A"
+        message = "tracker says it moved"
+
+    trigger = FakeTrigger()
+    key = orchestrator._trigger_key(trigger)
+    orchestrator._verdicts[key] = Analysis(
+        ok=True, kind="deviation", agrees=False, confidence=0.9,
+        what_happened="A hand passed over the item; it did not move.",
+    )
+
+    before = state.metrics.deviations
+    orchestrator.recovery_engine.detect = lambda _s: [trigger]  # type: ignore[assignment]
+    try:
+        orchestrator.handle_deviations()
+    finally:
+        import importlib
+        importlib.reload(orchestrator.recovery_engine)
+
+    assert state.metrics.deviations == before, "a refuted deviation must not fire"
+    assert any(e.type == "deviation_dismissed" for e in state.events)
+    orchestrator.reset_adjudication()

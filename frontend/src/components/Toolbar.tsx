@@ -1,4 +1,5 @@
 import type { Goal, WorldMode } from '../types/hive';
+import { AskFeed } from './AskFeed';
 import { PrimaryButton, DangerButton, ToolbarButton, StatusIndicator } from './primitives';
 
 interface ToolbarProps {
@@ -13,6 +14,10 @@ interface ToolbarProps {
   onPause?: () => void;
   onReset?: () => void;
   onEmergencyStop?: () => void;
+  feedAnswer?: { question: string; answer: string } | null;
+  feedAvailable?: boolean;
+  onAsk?: (question: string) => void;
+  onDismissFeed?: () => void;
   onOpenGraph?: () => void;
   onOpenInspector?: () => void;
 }
@@ -22,6 +27,7 @@ const MODE_LABEL: Record<WorldMode, string> = { live: 'Live', assisted: 'Assiste
 export function Toolbar({
   goal, connectedWorkers, totalWorkers, mode, executing, connected = true, reconnecting = false,
   onStart, onPause, onReset, onEmergencyStop, onOpenGraph, onOpenInspector,
+  feedAnswer = null, feedAvailable = false, onAsk, onDismissFeed,
 }: ToolbarProps) {
   return (
     <header className="flex h-14 items-center gap-4 border-b border-separator bg-surface-primary px-4">
@@ -48,6 +54,14 @@ export function Toolbar({
       <span className="text-[13px] text-text-tertiary">{MODE_LABEL[mode]}</span>
 
       <div className="ml-auto flex items-center gap-2">
+        {onAsk && (
+          <AskFeed
+            answer={feedAnswer}
+            available={feedAvailable}
+            onAsk={onAsk}
+            onDismiss={() => onDismissFeed?.()}
+          />
+        )}
         <ToolbarButton onClick={onOpenInspector} className="xl:hidden">Inspector</ToolbarButton>
         <ToolbarButton onClick={onOpenGraph}>Task graph</ToolbarButton>
         {executing ? (

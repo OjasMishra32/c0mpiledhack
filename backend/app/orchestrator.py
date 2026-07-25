@@ -187,13 +187,113 @@ def unlock_dependents() -> None:
 # ── 6-8. deviation + recovery ───────────────────────────────────────────────
 
 
+# ── adjudication ────────────────────────────────────────────────────────────
+#
+# A tracker crossing a rectangle is a hypothesis, not a fact. Before a red banner goes on
+# the projector we can ask a model that reasons about physical scenes whether the item
+# genuinely moved, or was briefly occluded by a hand, or was misclassified.
+#
+# Two rules make this safe to put in the demo path:
+#   * It never blocks the tick. The request runs as a task; the tick keeps going.
+#   * It FAILS OPEN. If the model is slow, unreachable or unsure, the deviation fires
+#     anyway after ADJUDICATION_TIMEOUT. A hung endpoint must never be able to swallow a
+#     real deviation — a late alarm is recoverable, a missing one is not.
+
+ADJUDICATION_TIMEOUT = 3.0
+
+_adjudicating: dict[str, float] = {}          # trigger key -> started at (monotonic)
+_verdicts: dict[str, Any] = {}                # trigger key -> Analysis
+_seen_triggers: set[str] = set()
+
+
+def _trigger_key(trigger: Any) -> str:
+    return f"{trigger.kind}:{trigger.object_id or trigger.worker_id or ''}:{','.join(trigger.action_ids)}"
+
+
 def handle_deviations() -> None:
     triggers = recovery_engine.detect(state)
     if not triggers:
         return
+
     for trigger in triggers[:2]:  # never storm the UI
+        key = _trigger_key(trigger)
+
+        verdict = _verdicts.pop(key, None)
+        if verdict is not None:
+            _adjudicating.pop(key, None)
+            if verdict.ok and verdict.agrees is False and verdict.confidence >= 0.6:
+                # The scene model reviewed the footage and disagrees with the tracker.
+                # Say so quietly — this is HIVE declining to cry wolf, which is worth
+                # showing, but it is not a headline.
+                _seen_triggers.add(key)
+                state.emit_soon(
+                    "deviation_dismissed",
+                    f"Scene model reviewed the last two seconds: {verdict.what_happened} "
+                    f"No deviation.",
+                    severity="info",
+                    kind=trigger.kind,
+                )
+                continue
+            if verdict.ok and verdict.what_happened:
+                # Confirmed — let the model's own sentence carry the banner.
+                trigger.message = verdict.what_happened
+
+        elif _should_adjudicate(key):
+            _start_adjudication(key, trigger)
+            continue  # hold this trigger for one round
+
         plan = recovery_engine.plan_recovery(trigger, state)
         _apply_recovery(plan)
+
+
+def _should_adjudicate(key: str) -> bool:
+    from .perception.analyzer import analyzer
+    from .vision import bridge
+
+    if key in _seen_triggers:
+        return False
+    started = _adjudicating.get(key)
+    if started is not None:
+        # Already in flight — hold, unless it has taken too long, then fail open.
+        return (time.monotonic() - started) < ADJUDICATION_TIMEOUT
+    if not analyzer.enabled or not bridge.camera_online():
+        return False
+    return analyzer.should_analyze()
+
+
+def _start_adjudication(key: str, trigger: Any) -> None:
+    from .perception.analyzer import analyzer
+    from .vision import bridge
+
+    if _adjudicating.get(key) is not None:
+        return
+    frames = bridge.burst(count=settings.vlm_burst_frames, seconds=2.5)
+    if not frames:
+        return
+    _adjudicating[key] = time.monotonic()
+
+    expected = trigger.expected or f"{state.label_of(trigger.object_id)} in its planned location"
+    observed = trigger.observed or trigger.message
+    context = (
+        f"The item is being moved as part of: {state.actions[trigger.action_ids[0]].description}"
+        if trigger.action_ids and trigger.action_ids[0] in state.actions
+        else ""
+    )
+
+    async def run() -> None:
+        try:
+            _verdicts[key] = await analyzer.analyze_deviation(expected, observed, frames, context)
+        except Exception:
+            log.exception("adjudication")
+            _adjudicating.pop(key, None)
+
+    asyncio.create_task(run())
+
+
+def reset_adjudication() -> None:
+    _adjudicating.clear()
+    _verdicts.clear()
+    _seen_triggers.clear()
 
 
 def _apply_recovery(plan: recovery_engine.RecoveryPlan) -> None:

@@ -12,7 +12,7 @@ import { WorldView, type ActivePath } from '../components/WorldView';
 import { useHiveState } from '../hooks/useHiveState';
 
 export function Host() {
-  const { state, derived, connected, reconnecting, send } = useHiveState();
+  const { state, derived, connected, reconnecting, send, dismissFeed } = useHiveState();
   const [selection, setSelection] = useState<Selection>(null);
   const [graphOpen, setGraphOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -80,6 +80,10 @@ export function Host() {
         onPause={() => send(executing ? 'host_pause_all' : 'host_resume_all')}
         onEmergencyStop={() => send('host_emergency_stop')}
         onReset={() => send('host_reset')}
+        feedAnswer={state.feedAnswer}
+        feedAvailable={state.world.camera_online ?? false}
+        onAsk={(q) => send('host_ask_feed', { question: q })}
+        onDismissFeed={dismissFeed}
         onOpenGraph={() => setGraphOpen((v) => !v)}
         onOpenInspector={() => setInspectorOpen((v) => !v)}
       />

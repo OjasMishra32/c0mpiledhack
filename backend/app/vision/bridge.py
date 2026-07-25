@@ -88,14 +88,37 @@ def simulator(state: Any):
 
 
 def open_camera(index: int | None = None) -> bool:
+    """Open the configured camera, falling back to any device that actually works.
+
+    Capture indices shift whenever something is plugged, unplugged, or a phone wanders
+    into Continuity Camera range — so the index that worked during setup is not
+    guaranteed to work at demo time. Rather than fail, find a device that produces a
+    frame and say which one we took.
+    """
     cam = camera()
     if index is not None and index != cam.index:
         release_camera()
         cam.index = index
-    ok = cam.open()
-    if ok:
+
+    if cam.open():
         _start_ring()
-    return ok
+        return True
+
+    from ..config import settings
+
+    for candidate in range(4):
+        if candidate == cam.index:
+            continue
+        release_camera()
+        cam.index = candidate
+        if cam.open():
+            settings.camera_index = candidate
+            log.warning("camera %s unavailable — using camera %s instead", index or "configured", candidate)
+            _start_ring()
+            return True
+
+    log.warning("no usable camera found — staying in simulation")
+    return False
 
 
 def release_camera() -> None:
