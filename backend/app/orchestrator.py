@@ -89,9 +89,13 @@ async def tick() -> None:
     await handle_deviations()
     schedule_actions()
     dispatch()
+    # Metrics BEFORE the completion check: goal_completed quotes these counters in its
+    # headline and ships them as the after-action report. Reading last tick's values
+    # undercounts every action that reached "verified" in this very tick — which is
+    # exactly the tick the objective completes on.
+    state.tick_metrics()
     check_goal()
 
-    state.tick_metrics()
     await flush_outbox()
     await ws.flush()
 

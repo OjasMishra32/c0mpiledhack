@@ -153,7 +153,7 @@ export function Host() {
           )}
 
           {graphOpen && state.actions.length > 0 && (
-            <div className="absolute inset-0 z-10 bg-background/98">
+            <div className="absolute inset-0 z-10 bg-background/95">
               <TaskGraph
                 actions={state.actions}
                 objects={state.scene.objects}
