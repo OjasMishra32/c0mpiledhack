@@ -395,3 +395,19 @@ async def test_demo_mode_shortens_action_timeouts(state):
         assert a.timeout_seconds == settings.action_timeout
     if settings.demo_mode:
         assert settings.action_timeout < settings.default_timeout_seconds
+
+
+async def test_events_never_reach_worker_sockets(state):
+    """The premise of the demo is that a worker sees only their own next action. Event
+    lines contain other workers' instruction text verbatim, so they are host-only."""
+    import inspect
+
+    from app import state as state_mod
+    from app import websocket_manager as wsm
+
+    for mod in (state_mod, wsm):
+        src = inspect.getsource(mod)
+        assert 'broadcast("event"' not in src, (
+            f"{mod.__name__} fans events out to every phone — a judge with devtools open "
+            "could read the whole plan"
+        )

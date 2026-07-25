@@ -10,6 +10,7 @@ Two hard guarantees:
 from __future__ import annotations
 
 import logging
+import itertools
 from contextlib import suppress
 from typing import Any
 from uuid import uuid4
@@ -26,8 +27,17 @@ class SlotsFull(Exception):
     pass
 
 
-def envelope(type: str, payload: Any, seq: int = 0) -> dict[str, Any]:
-    return Envelope(type=type, payload=payload, ts=now_iso(), seq=seq).model_dump()
+_envelope_seq = itertools.count(1)
+
+
+def envelope(type: str, payload: Any, seq: int | None = None) -> dict[str, Any]:
+    """Every frame carries a monotonic seq so clients can dedupe on reconnect.
+
+    This was hardcoded to 0, which silently disabled the client-side dedupe.
+    """
+    return Envelope(
+        type=type, payload=payload, ts=now_iso(), seq=seq if seq is not None else next(_envelope_seq)
+    ).model_dump()
 
 
 class WSManager:
@@ -72,7 +82,7 @@ class WSManager:
                 },
             )
         for ev in state.drain_pending_events():
-            await self.broadcast("event", ev.model_dump())
+            await self.broadcast_host("event", ev.model_dump())
 
     # ── connect ─────────────────────────────────────────────────────────────
 

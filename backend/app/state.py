@@ -133,7 +133,7 @@ class HiveState:
             self.events.append(ev)
         from .websocket_manager import ws  # local import: avoids a cycle
 
-        await ws.broadcast("event", ev.model_dump())
+        await ws.broadcast_host("event", ev.model_dump())
         return ev
 
     def emit_soon(
