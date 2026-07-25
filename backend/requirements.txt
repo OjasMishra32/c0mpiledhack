@@ -1,0 +1,13 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+websockets>=13.0
+networkx>=3.4
+numpy>=2.0
+opencv-python>=4.10
+httpx>=0.27
+openai>=1.54            # used as the client for NVIDIA NIM (OpenAI-compatible API)
+python-multipart>=0.0.12
+pytest>=8.3
+pytest-asyncio>=0.24
