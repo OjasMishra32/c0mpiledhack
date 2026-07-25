@@ -1,49 +1,49 @@
-"""LLM planner — NVIDIA NIM, OpenAI-compatible tool calling.
+"""The LLM planner — an upgrade over the template planner, never a dependency.
 
-OWNER: Zechariah.
+NVIDIA NIM exposes an OpenAI-compatible API, so this is the `openai` async client pointed at
+the NIM base URL with our single `NVIDIA_API_KEY`.
 
-Forces a tool call so prose can't come back. Degrades: tool_choice → json_object →
-strict-JSON extraction → (caller falls back to the template library).
+We force a **tool call** instead of begging for raw JSON, which removes most of the failure
+modes people hit here. If a model ignores `tool_choice` we degrade without fighting it:
+
+    forced tool call → response_format=json_object → strict-JSON prompt + _extract_json()
+
+Any exception at all lands the caller on the template planner. That is the contract.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+import re
+from typing import TYPE_CHECKING, Any
 
 from ..config import settings
-from ..models import SUPPORTED_ACTIONS, Action, Predicate
-from ..perception import nim_client
-from .grounding import GroundingResult
+from ..models import Action, ActionStatus, Predicate, Scene, SUPPORTED_ACTIONS
+from .grounding import Binding, GroundingResult
+from .prompts import (
+    GROUNDING_SYSTEM_PROMPT,
+    REPLAN_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    render_context,
+    render_grounding,
+    render_replan,
+)
 
-log = logging.getLogger("hive.planner.llm")
+if TYPE_CHECKING:
+    from .base import PlanContext, PlanResult
 
-SYSTEM_PROMPT = """You are HIVE's operations compiler. You convert a high-level objective for a
-physical operation into a minimal, validated task graph executed by individual humans who each
-receive ONLY their own next instruction.
+log = logging.getLogger(__name__)
 
-CRITICAL CONSTRAINT: workers cannot see the objective, the plan, each other's instructions, or the
-state of the operation. Every action description must be fully self-contained and physically
-unambiguous to someone who knows nothing else. Never write an instruction that depends on shared
-knowledge, on another worker's action, or on the word "then".
-
-RULES
-- Use ONLY the object ids, zone ids, and action types provided. Invent nothing.
-- One atomic physical movement per action. No compound actions.
-- Express ordering ONLY through the dependencies array, never through wording.
-- Maximize parallelism: actions touching different objects and different zones must NOT depend
-  on each other.
-- Never let two concurrent actions manipulate the same object or target the same zone.
-- When one object is placed on another, add a hold action on the base object before it and a
-  release action after it.
-- Do not assign workers. Leave assigned_worker_id unset; a scheduler assigns by capability.
-- Priority: life-safety or explicitly expedited work 100, work that blocks other work 85,
-  routine 65, background 50.
-- Include expected_predicates for every action and success_predicates for the objective.
-- End with one final inspect action depending on all location verifications.
-- At most 16 actions. Aim for 9-13.
-
-Call emit_plan exactly once. Produce no other output."""
+_PREDICATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string"},
+        "subject": {"type": "string"},
+        "object": {"type": ["string", "null"]},
+    },
+    "required": ["type", "subject"],
+}
 
 PLAN_TOOL = {
     "type": "function",
@@ -54,7 +54,6 @@ PLAN_TOOL = {
             "type": "object",
             "properties": {
                 "normalized_intent": {"type": "string"},
-                "notes": {"type": "string"},
                 "actions": {
                     "type": "array",
                     "items": {
@@ -68,149 +67,248 @@ PLAN_TOOL = {
                             "target_object_id": {"type": ["string", "null"]},
                             "dependencies": {"type": "array", "items": {"type": "string"}},
                             "priority": {"type": "integer"},
-                            "expected_predicates": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"type": "string"},
-                                        "subject": {"type": "string"},
-                                        "object": {"type": ["string", "null"]},
-                                    },
-                                    "required": ["type", "subject"],
-                                },
-                            },
+                            "expected_predicates": {"type": "array", "items": _PREDICATE_SCHEMA},
                         },
-                        "required": ["id", "type", "description", "dependencies", "priority"],
+                        "required": ["id", "type", "description", "object_id", "dependencies", "priority"],
                     },
                 },
-                "success_predicates": {"type": "array", "items": {"type": "object"}},
+                "success_predicates": {"type": "array", "items": _PREDICATE_SCHEMA},
+                "notes": {"type": "string"},
             },
             "required": ["normalized_intent", "actions", "success_predicates"],
         },
     },
 }
 
-
-def render_context(goal_text: str, g: GroundingResult, state: Any) -> str:
-    objs = "\n".join(
-        f"  - {o.id}: {o.display_label()} (colour {o.descriptor.color_name}, "
-        f"shape {o.descriptor.shape_hint}, currently in {state.zone_label(o.zone)})"
-        for o in state.scene.objects
-    )
-    zones = "\n".join(f"  - {z.id}: {z.label}" for z in state.scene.zones)
-    workers = "\n".join(
-        f"  - {w.id} ({w.callsign}, {w.role}): reaches {', '.join(w.reachable_zones)}"
-        for w in state.workers.values()
-    )
-    binds = "\n".join(
-        f"  - “{b.phrase}” → {b.object_id} ({b.basis}, {int(b.confidence * 100)}%)"
-        for b in (g.bindings if g else [])
-    )
-    return f"""OBJECTIVE
-{goal_text}
-
-OBSERVED OBJECTS (these are the only objects that exist)
-{objs or "  (none)"}
-
-LOCATIONS
-{zones or "  (none)"}
-
-WORKERS
-{workers}
-
-PHRASE BINDINGS ALREADY RESOLVED FROM THE LIVE CAMERA
-{binds or "  (none)"}
-
-SUPPORTED ACTION TYPES
-  {", ".join(SUPPORTED_ACTIONS)}
-
-SUPPORTED PREDICATE TYPES
-  object_in_zone, object_near_object, object_stacked_on, object_held_by,
-  all_objects_in_zone, sequence_completed, object_visible
-
-Compile the objective into a task graph over the observed object ids."""
+BINDINGS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "emit_bindings",
+        "description": "Bind noun phrases from the objective to observed object ids.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bindings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "phrase": {"type": "string"},
+                            "object_id": {"type": ["string", "null"]},
+                            "object_ids": {"type": "array", "items": {"type": "string"}},
+                            "why": {"type": "string"},
+                        },
+                        "required": ["phrase"],
+                    },
+                }
+            },
+            "required": ["bindings"],
+        },
+    },
+}
 
 
-async def compile_llm(goal_text: str, g: GroundingResult, state: Any):
+def _client():
+    from openai import AsyncOpenAI  # imported lazily so a keyless run never touches it
+
+    # Draw from the shared pool so this and perception never double-spend one key's budget.
+    try:
+        from ..key_pool import get_pool
+
+        pool = get_pool(settings.nim_keys, settings.nim_per_key_rpm, settings.nim_key_strategy)
+        if pool and pool.count:
+            import random
+
+            key = pool.keys[random.randrange(pool.count)]
+            return AsyncOpenAI(base_url=settings.nim_base_url, api_key=key)
+    except Exception:
+        pass
+
+    return AsyncOpenAI(base_url=settings.nim_base_url, api_key=settings.nvidia_api_key)
+
+
+def _extract_json(text: str) -> dict:
+    """Strip fences, take the outermost object, parse. Written early because you will need it."""
+    if not text:
+        raise ValueError("empty completion")
+    cleaned = re.sub(r"```(?:json)?", "", text).strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object in completion")
+    return json.loads(cleaned[start : end + 1])
+
+
+def _coerce_predicates(raw: Any) -> list[Predicate]:
+    out: list[Predicate] = []
+    for item in raw or []:
+        if not isinstance(item, dict) or not item.get("type") or not item.get("subject"):
+            continue
+        out.append(
+            Predicate(
+                type=str(item["type"]),
+                subject=str(item["subject"]),
+                object=(str(item["object"]) if item.get("object") not in (None, "") else None),
+                tolerance=item.get("tolerance"),
+            )
+        )
+    return out
+
+
+def to_plan_result(payload: dict, ctx: "PlanContext", source: str = "llm") -> "PlanResult":
+    """Model output → typed actions. Tolerant on the way in; the validator is the gate."""
     from .base import PlanResult
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": render_context(goal_text, g, state)},
-    ]
-    models = [settings.planner_model] + [
-        m.strip() for m in (settings.planner_fallbacks or "").split(",") if m.strip()
-    ]
-
-    data = None
-    used = ""
-    for model in models:
-        # Tool calling first (prose can't come back), then JSON mode, then extraction.
-        # Endpoints differ in what they honour, so degrade rather than fail.
-        resp = await nim_client.chat(
-            model, messages, tier="planner", affinity="planner",
-            timeout=settings.planner_timeout, max_tokens=2600, temperature=0.2,
-            tools=[PLAN_TOOL], tool_choice={"type": "function", "function": {"name": "emit_plan"}},
-            max_attempts=1,
-        )
-        data = nim_client.tool_args_of(resp, "emit_plan") or nim_client._extract_json(
-            nim_client.content_of(resp)
-        )
-        if not data:
-            resp = await nim_client.chat(
-                model, messages, tier="planner", affinity="planner",
-                timeout=settings.planner_timeout, max_tokens=2600, temperature=0.2,
-                response_json=True, max_attempts=1,
+    actions: list[Action] = []
+    for i, raw in enumerate(payload.get("actions") or [], start=1):
+        if not isinstance(raw, dict) or not raw.get("type"):
+            continue
+        deps = [str(d) for d in (raw.get("dependencies") or []) if isinstance(d, (str, int))]
+        actions.append(
+            Action(
+                id=str(raw.get("id") or f"a{i}"),
+                type=str(raw["type"]),
+                description=str(raw.get("description") or "").strip() or "Perform the next step.",
+                object_id=(str(raw["object_id"]) if raw.get("object_id") else None),
+                target_object_id=(str(raw["target_object_id"]) if raw.get("target_object_id") else None),
+                target_zone=(str(raw["target_zone"]) if raw.get("target_zone") else None),
+                dependencies=deps,
+                priority=int(raw.get("priority") or 70),
+                expected_predicates=_coerce_predicates(raw.get("expected_predicates")),
+                status=ActionStatus.queued.value,
             )
-            data = nim_client._extract_json(nim_client.content_of(resp))
-        if data and isinstance(data.get("actions"), list) and data["actions"]:
-            used = model
-            break
-        data = None
-
-    if not data:
-        return None
-    log.info("plan compiled by %s", used)
-
-    actions = [_to_action(raw, state) for raw in data["actions"]]
-    actions = [a for a in actions if a]
-    if not actions:
-        return None
-
+        )
     return PlanResult(
-        actions=actions,  # type: ignore[arg-type]
-        success_predicates=[_to_pred(p) for p in data.get("success_predicates", []) if _to_pred(p)],  # type: ignore[misc]
-        source="llm",
-        normalized_intent=data.get("normalized_intent", "compiled_objective"),
-        notes=data.get("notes") or f"{len(actions)} actions · compiled by {used.split('/')[-1]}",
+        actions=actions,
+        success_predicates=_coerce_predicates(payload.get("success_predicates")),
+        source=source,
+        normalized_intent=str(payload.get("normalized_intent") or ""),
+        notes=str(payload.get("notes") or ""),
+        grounding=ctx.bindings,
     )
 
 
-def _to_action(raw: dict[str, Any], state: Any) -> Action | None:
-    try:
-        return Action(
-            id=str(raw["id"]),
-            type=raw["type"],
-            description=str(raw.get("description") or "").strip() or "Perform the assigned action.",
-            object_id=raw.get("object_id") or None,
-            target_object_id=raw.get("target_object_id") or None,
-            target_zone=raw.get("target_zone") or None,
-            dependencies=[str(d) for d in (raw.get("dependencies") or [])],
-            priority=int(raw.get("priority") or 60),
-            timeout_seconds=settings.action_timeout,
-            expected_predicates=[p for p in map(_to_pred, raw.get("expected_predicates") or []) if p],
+class LLMPlanner:
+    """Every method here either returns a PlanResult or raises. Raising is a normal outcome."""
+
+    async def _call(self, system: str, user: str, tool: dict, tool_name: str, max_tokens: int = 3000) -> dict:
+        client = _client()
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+        # 1 — forced tool call: you cannot get prose back
+        try:
+            resp = await client.chat.completions.create(
+                model=settings.planner_model,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                messages=messages,
+                tools=[tool],
+                tool_choice={"type": "function", "function": {"name": tool_name}},
+            )
+            calls = resp.choices[0].message.tool_calls
+            if calls:
+                return json.loads(calls[0].function.arguments)
+            log.warning("%s ignored tool_choice; degrading to json_object", settings.planner_model)
+        except Exception as exc:
+            if _is_tool_support_error(exc):
+                log.warning("tool calling unsupported (%s); degrading to json_object", exc)
+            else:
+                raise
+
+        # 2 — structured JSON mode
+        try:
+            resp = await client.chat.completions.create(
+                model=settings.planner_model,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
+            return _extract_json(resp.choices[0].message.content or "")
+        except Exception as exc:
+            log.warning("json_object mode failed (%s); degrading to strict-JSON prompt", exc)
+
+        # 3 — strict-JSON prompt, parsed defensively
+        schema = json.dumps(tool["function"]["parameters"], separators=(",", ":"))
+        resp = await client.chat.completions.create(
+            model=settings.planner_model,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            messages=messages
+            + [
+                {
+                    "role": "system",
+                    "content": f"Reply with ONE JSON object matching this schema and nothing else: {schema}",
+                }
+            ],
         )
-    except Exception:
-        return None
+        return _extract_json(resp.choices[0].message.content or "")
+
+    async def compile(self, goal_text: str, ctx: "PlanContext") -> "PlanResult":
+        payload = await self._call(SYSTEM_PROMPT, render_context(goal_text, ctx), PLAN_TOOL, "emit_plan")
+        result = to_plan_result(payload, ctx)
+        if not result.actions:
+            raise ValueError("model returned an empty plan")
+        return result
+
+    async def replan(self, goal_text: str, ctx: "PlanContext", deviation: dict) -> "PlanResult":
+        payload = await self._call(
+            REPLAN_SYSTEM_PROMPT, render_replan(goal_text, ctx, deviation), PLAN_TOOL, "emit_plan", max_tokens=2000
+        )
+        result = to_plan_result(payload, ctx)
+        if not result.actions:
+            raise ValueError("model returned an empty replan")
+        return result
 
 
-def _to_pred(raw: Any) -> Predicate | None:
-    if not isinstance(raw, dict):
-        return None
-    try:
-        return Predicate(
-            type=raw["type"], subject=str(raw["subject"]), object=raw.get("object") or None
-        )
-    except Exception:
-        return None
+def _is_tool_support_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(s in text for s in ("tool", "function", "unsupported", "not supported", "400"))
+
+
+async def llm_refine_grounding(goal_text: str, scene: Scene, grounding: GroundingResult) -> None:
+    """Resolve leftovers the descriptor scorer could not: pronouns, relational language.
+
+    Mutates `grounding` in place and only ever *fills gaps* — it never overrides a phrase the
+    deterministic scorer already bound confidently.
+    """
+    payload = await LLMPlanner()._call(
+        GROUNDING_SYSTEM_PROMPT, render_grounding(goal_text, scene), BINDINGS_TOOL, "emit_bindings", max_tokens=800
+    )
+    known = {o.id for o in scene.objects}
+    pending = {a.phrase for a in grounding.ambiguous} | set(grounding.unresolved_phrases)
+    resolved: list[str] = []
+
+    for item in payload.get("bindings") or []:
+        phrase = str(item.get("phrase") or "").strip()
+        if not phrase or phrase not in pending:
+            continue
+        ids = [str(i) for i in (item.get("object_ids") or []) if str(i) in known]
+        if not ids and item.get("object_id") and str(item["object_id"]) in known:
+            ids = [str(item["object_id"])]
+        if not ids:
+            continue
+        existing = next((b for b in grounding.bindings if b.phrase == phrase), None)
+        if existing is not None:
+            existing.object_ids = ids
+            existing.confidence = 0.8
+            existing.basis = f"resolved by the planner model — {item.get('why') or 'relational reference'}"
+        else:
+            grounding.bindings.append(
+                Binding(
+                    phrase=phrase,
+                    object_ids=ids,
+                    confidence=0.8,
+                    basis=f"resolved by the planner model — {item.get('why') or 'relational reference'}",
+                )
+            )
+        resolved.append(phrase)
+
+    if not resolved:
+        return
+    grounding.ambiguous = [a for a in grounding.ambiguous if a.phrase not in resolved]
+    grounding.unresolved_phrases = [p for p in grounding.unresolved_phrases if p not in resolved]
+    grounding.bindings.sort(key=lambda b: b.span[0])
+    from .grounding import _pair_deliveries  # recompute pairings with the new bindings
+
+    grounding.deliveries = _pair_deliveries(grounding.bindings, grounding.zone_bindings, goal_text)
+    grounding.apply_roles(scene)

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # hosted planners take 20s+ on a full prompt. A live compile must feel immediate, so the
     # LLM gets a short window and we fall through to the template library without drama.
     planner_timeout: float = 8.0
+    # Names the planner module reads (authored against the contract independently).
+    planner_timeout_seconds: float = 8.0
+    replan_timeout_seconds: float = 8.0
+    grounding_timeout_seconds: float = 6.0
     vlm_enabled: bool = True
     vlm_reason_timeout: float = 6.0
     vlm_fallback_timeout: float = 6.0
@@ -84,6 +88,12 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# The planner module reads `nvidia_api_key` directly. When keys are supplied as a pool,
+# surface the first one there so a single-key consumer still works — the pooled client
+# remains the path every request actually takes.
+if not settings.nvidia_api_key and settings.nim_keys:
+    settings.nvidia_api_key = settings.nim_keys[0]
 
 
 def lan_ip() -> str:

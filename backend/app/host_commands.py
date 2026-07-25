@@ -12,8 +12,8 @@ import logging
 from typing import Any
 
 from .config import settings
-from .models import Evidence, Point, now_iso
-from .planner.base import compile_goal, make_goal, upgrade_plan
+from .models import Evidence, Goal, Point, now_iso
+from .planner.base import NotReady, compile_goal
 from .state import state
 from .vision import world_model
 from .websocket_manager import ws
@@ -33,111 +33,143 @@ async def h_compile_goal(p: dict[str, Any]) -> None:
     state.execution_status = "planning"
     await state.emit("plan_compiling", "Compiling objective into an execution graph…", severity="info")
 
-    result = await compile_goal(text, state)
+    # Compile WITHOUT the hosted model first. The template compiler is instant and correct,
+    # and the compile step is the one moment an operator watches a spinner. The model runs
+    # concurrently below and only ever upgrades the result.
+    try:
+        result = await compile_goal(
+            text,
+            state.scene,
+            list(state.workers.values()),
+            scenario_id=state.scenario.id,
+            hints=state.scenario.expected_roles,
+            use_llm=False,
+        )
+    except NotReady as e:
+        state.execution_status = "idle"
+        await state.emit("plan_failed", str(e), severity="critical")
+        await ws.broadcast_host("error_event", {"code": "not_ready", "message": str(e)})
+        return
+    except Exception as e:
+        state.execution_status = "idle"
+        log.exception("compile")
+        await state.emit("plan_failed", f"Could not compile the objective ({type(e).__name__}).",
+                         severity="critical")
+        return
 
-    if result.pending and result.grounding:
-        state.pending_grounding = {"text": text, **result.grounding.ambiguous_payload()}
+    if result.is_pending and result.grounding:
+        payload = _ambiguity_payload(result.grounding)
+        state.pending_grounding = {"text": text, **payload}
         state.execution_status = "idle"
         await ws.broadcast_host("grounding_ambiguous", state.pending_grounding)
-        await state.emit(
-            "grounding_ambiguous",
-            state.pending_grounding["message"],
-            severity="warn",
-        )
+        await state.emit("grounding_ambiguous", payload["message"], severity="warn")
         return
 
-    if result.error:
+    if not result.actions:
         state.execution_status = "idle"
-        await state.emit("plan_failed", result.error, severity="critical")
-        await ws.broadcast_host("error_event", {"code": "plan_failed", "message": result.error})
+        await state.emit("plan_failed",
+                         "No executable actions for that objective. Try naming the items directly.",
+                         severity="critical")
         return
 
+    await _publish_plan(text, result, upgraded=False)
+
+    # Concurrently ask the hosted planner for a better graph.
+    asyncio.create_task(_try_upgrade(text))
+
+
+def _ambiguity_payload(grounding: Any) -> dict[str, Any]:
+    amb = list(getattr(grounding, "ambiguous", []) or [])
+    if not amb:
+        return {"phrase": "", "candidates": [], "message": "Identify the intended item."}
+    b = amb[0]
+    cands = [b.object_id] + list(getattr(b, "alternatives", []) or []) if b.object_id else []
+    return {
+        "phrase": b.phrase,
+        "candidates": [c for c in cands if c],
+        "message": f"Multiple items match \u201c{b.phrase}\u201d. Select the intended one.",
+    }
+
+
+async def _publish_plan(text: str, result: Any, *, upgraded: bool) -> None:
     # Bind resolved phrases onto objects so every instruction speaks human language.
     if result.grounding:
-        for b in result.grounding.bindings:
-            obj = state.scene.by_id(b.object_id or "")
-            if obj and b.object_id and not obj.role:
+        for b in getattr(result.grounding, "bindings", []) or []:
+            obj = state.scene.by_id(getattr(b, "object_id", "") or "")
+            if obj and not obj.role:
                 obj.role = b.phrase
-                obj.role_confidence = b.confidence
+                obj.role_confidence = getattr(b, "confidence", 1.0)
 
+    result.mark_ready()
     state.actions = {a.id: a for a in result.actions}
     for a in state.actions.values():
-        a.status = "available" if not a.dependencies else "queued"
-    state.goal = make_goal(text, result)
+        if a.status not in ("available", "queued"):
+            a.status = "available" if not a.dependencies else "queued"
+        a.timeout_seconds = a.timeout_seconds or settings.action_timeout
+
+    if state.goal is None or not upgraded:
+        state.goal = Goal(
+            raw_text=text,
+            normalized_intent=result.normalized_intent,
+            status="compiled",
+            success_predicates=result.success_predicates,
+            plan_source=result.source,
+            planner_notes=result.notes,
+            warnings=result.warnings,
+        )
+    else:
+        state.goal.plan_source = result.source
+        state.goal.planner_notes = result.notes
+
     state.execution_status = "idle"
     state.metrics.actions_total = len(state.actions)
 
-    from .planner.validator import topo_layers
-
-    layers = topo_layers(result.actions)
+    layers = result.layers()
     parallel = max((len(l) for l in layers), default=0)
-
     await ws.broadcast_host(
         "plan_compiled",
         {
             "goal": state.goal.model_dump(),
             "actions": [a.model_dump() for a in result.actions],
             "layers": layers,
-            "stats": {
-                "actions": len(result.actions),
-                "parallel_peak": parallel,
-                "depth": len(layers),
-                "source": result.source,
-            },
+            "stats": {**result.stats, "parallel_peak": parallel, "depth": len(layers),
+                      "source": result.source},
         },
     )
-    await state.emit(
-        "plan_compiled",
-        f"Objective compiled: {len(result.actions)} actions, {parallel} executable in parallel, "
-        f"{len(layers)} stages deep.",
-        severity="success",
-        source=result.source,
-    )
-    for wmsg in result.warnings[:3]:
-        await state.emit("plan_repaired", wmsg, severity="info")
+    if upgraded:
+        await state.emit("plan_upgraded",
+                         f"Plan refined by the AI planner: {len(result.actions)} actions.",
+                         severity="success", source=result.source)
+    else:
+        await state.emit(
+            "plan_compiled",
+            f"Objective compiled: {len(result.actions)} actions, {parallel} executable in "
+            f"parallel, {len(layers)} stages deep.",
+            severity="success", source=result.source,
+        )
+        for wmsg in (result.warnings or [])[:3]:
+            await state.emit("plan_repaired", wmsg, severity="info")
 
-    # Concurrently ask the hosted planner for a better graph. The template plan is already
-    # on screen and executable; this only ever upgrades it, and only before we start.
-    if result.grounding is not None:
-        asyncio.create_task(_try_upgrade(text, result.grounding))
 
-
-async def _try_upgrade(text: str, grounding) -> None:
-    better = await upgrade_plan(text, grounding, state)
-    if not better or not better.actions:
+async def _try_upgrade(text: str) -> None:
+    """Background LLM compile. Discarded if execution already started — swapping the graph
+    out from under running workers would be worse than a simpler plan."""
+    if not settings.has_model_access:
         return
-    if state.execution_status != "idle" or not state.goal:
-        return  # never swap the graph out from under running workers
-    state.actions = {a.id: a for a in better.actions}
-    for a in state.actions.values():
-        a.status = "available" if not a.dependencies else "queued"
-    state.goal.plan_source = better.source
-    state.goal.planner_notes = better.notes
-    state.metrics.actions_total = len(state.actions)
-
-    from .planner.validator import topo_layers
-
-    layers = topo_layers(better.actions)
-    await ws.broadcast_host(
-        "plan_compiled",
-        {
-            "goal": state.goal.model_dump(),
-            "actions": [a.model_dump() for a in better.actions],
-            "layers": layers,
-            "stats": {
-                "actions": len(better.actions),
-                "parallel_peak": max((len(l) for l in layers), default=0),
-                "depth": len(layers),
-                "source": better.source,
-            },
-        },
-    )
-    await state.emit(
-        "plan_upgraded",
-        f"Plan refined by the AI planner: {len(better.actions)} actions.",
-        severity="success",
-        source=better.source,
-    )
+    try:
+        better = await asyncio.wait_for(
+            compile_goal(text, state.scene, list(state.workers.values()),
+                         scenario_id=state.scenario.id, hints=state.scenario.expected_roles,
+                         use_llm=True),
+            timeout=settings.planner_timeout + 8,
+        )
+    except Exception as e:
+        log.info("planner upgrade unavailable (%s) — keeping the template plan", type(e).__name__)
+        return
+    if (not better or not better.actions or better.is_pending
+            or better.source != "llm" or state.execution_status != "idle"):
+        return
+    await _publish_plan(text, better, upgraded=True)
 
 
 async def h_start(p: dict[str, Any]) -> None:

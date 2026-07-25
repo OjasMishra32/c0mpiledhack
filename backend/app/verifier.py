@@ -47,7 +47,7 @@ def check_predicate(pred: Predicate, state: Any) -> tuple[bool, Evidence | None]
         a, b = scene.by_id(pred.subject), scene.by_id(pred.object or "")
         if not a or not b:
             return False, None
-        if a.position.dist(b.position) > pred.tolerance:
+        if a.position.dist(b.position) > (pred.tolerance or 0.12):
             return False, None
         return True, Evidence(
             kind="simulation" if sim else "vision",  # type: ignore[arg-type]
@@ -84,19 +84,38 @@ def check_predicate(pred: Predicate, state: Any) -> tuple[bool, Evidence | None]
         return False, None
 
     if pred.type == "all_objects_in_zone":
-        ids = [i for i in (pred.subject or "").split("|") if i]
+        # Two encodings are in use and both are legitimate:
+        #   subject = "obj_1|obj_2"  → those specific objects
+        #   subject = "<zone_id>"    → every object the plan routes to that zone
+        # See docs/CONTRACTS.md §2. Accepting both keeps planner and verifier decoupled.
+        zone_id = pred.object or pred.subject
+        ids = [i for i in (pred.subject or "").split("|") if i and scene.by_id(i)]
+        if not ids:
+            ids = sorted({
+                a.object_id
+                for a in state.actions.values()
+                if a.object_id and a.target_zone == zone_id
+            })
         objs = [scene.by_id(i) for i in ids]
-        if not objs or any(o is None or o.zone != pred.object for o in objs):
+        if not objs or any(o is None or o.zone != zone_id for o in objs):
             return False, None
         return True, Evidence(
             kind="simulation" if sim else "vision",  # type: ignore[arg-type]
             confidence=min(o.confidence for o in objs if o),
-            detail=f"{len(objs)} items in {state.zone_label(pred.object)}",
+            detail=f"{len(objs)} items in {state.zone_label(zone_id)}",
         )
 
     if pred.type == "sequence_completed":
-        ids = [i for i in (pred.subject or "").split("|") if i]
-        if ids and all(state.actions.get(i) and state.actions[i].status == "verified" for i in ids):
+        # subject = "a1|a2" (specific actions) or a sentinel like "objective", which means
+        # "every other action in the plan". Both appear in practice.
+        ids = [i for i in (pred.subject or "").split("|") if i in state.actions]
+        if not ids:
+            ids = [
+                a.id
+                for a in state.actions.values()
+                if a.id != getattr(_current_action_id, "value", None)
+            ]
+        if ids and all(state.actions[i].status in ("verified", "cancelled") for i in ids):
             return True, Evidence(kind="system", confidence=1.0, detail="all prerequisites verified")
         return False, None
 
@@ -113,7 +132,15 @@ def check_predicate(pred: Predicate, state: Any) -> tuple[bool, Evidence | None]
     return False, None
 
 
+class _Ctx:
+    value: str | None = None
+
+
+_current_action_id = _Ctx()
+
+
 def evaluate(action: Action, state: Any) -> VerificationResult:
+    _current_action_id.value = action.id
     evidence: list[Evidence] = list(action.evidence)
     failed: list[str] = []
 

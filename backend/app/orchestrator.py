@@ -304,8 +304,51 @@ def _cancel_instruction(a: Action, reason: str) -> None:
 # ── 9. scheduling ───────────────────────────────────────────────────────────
 
 
+class _SchedulerView:
+    """List-shaped view of HiveState, matching scheduler.SchedulerState.
+
+    HiveState keys actions and workers by id because everything else looks them up that
+    way; the scheduler iterates. One tiny adapter beats changing either side.
+    """
+
+    __slots__ = ("_s",)
+
+    def __init__(self, s: Any) -> None:
+        self._s = s
+
+    @property
+    def actions(self) -> list:
+        return list(self._s.actions.values())
+
+    @property
+    def workers(self) -> list:
+        return list(self._s.workers.values())
+
+    @property
+    def scene(self):
+        return self._s.scene
+
+    @property
+    def locks(self) -> dict:
+        return self._s.locks
+
+    @property
+    def objects(self):
+        return self._s.scene.objects
+
+    @property
+    def zones(self):
+        return self._s.scene.zones
+
+    def worker_by_id(self, worker_id: str):
+        return self._s.workers.get(worker_id)
+
+    def action_by_id(self, action_id: str):
+        return self._s.actions.get(action_id)
+
+
 def schedule_actions() -> None:
-    for action, assignment in scheduler.select_batch(state):
+    for action, assignment in scheduler.select_batch(_SchedulerView(state)):
         action.assigned_worker_id = assignment.worker_id
         action.assignment_reason = assignment.reason
         action.status = "assigned"

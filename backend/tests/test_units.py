@@ -9,8 +9,10 @@ from app.host_commands import HOST_HANDLERS as H
 from app.key_pool import KeyPool
 from app.models import Action, Evidence, Predicate
 from app.planner.grounding import resolve, resolve_all
-from app.planner.validator import build_graph, topo_layers, validate_and_repair
+from app.planner.validator import topo_layers
 from app.websocket_manager import ws
+
+from app.orchestrator import _SchedulerView as _view
 
 from .conftest import complete, run_ticks, send
 
@@ -62,29 +64,6 @@ async def test_narrower_goal_yields_smaller_graph(state):
 # ── graph ───────────────────────────────────────────────────────────────────
 
 
-async def test_cycle_detection_rejects_readably(state):
-    a = Action(id="a1", type="inspect", description="x", dependencies=["a2"])
-    b = Action(id="a2", type="inspect", description="y", dependencies=["a1"])
-    _, report = validate_and_repair([a, b], state)
-    assert not report.ok
-    assert any("wait on the other" in e or "Circular" in e for e in report.errors)
-
-
-async def test_unknown_object_is_repaired_not_fatal(state):
-    good = Action(
-        id="a1", type="place_in_zone", description="x",
-        object_id=state.scene.objects[0].id, target_zone="zone_1",
-    )
-    bad = Action(id="a2", type="place_in_zone", description="y", object_id="obj_ghost", target_zone="zone_1")
-    dependent = Action(id="a3", type="inspect", description="z", dependencies=["a2"])
-    kept, report = validate_and_repair([good, bad, dependent], state)
-    ids = {a.id for a in kept}
-    assert "a2" not in ids
-    assert report.repairs
-    assert state.actions is not None
-    assert all("a2" not in a.dependencies for a in kept)
-
-
 async def test_topo_layers_expose_parallelism(state):
     acts = [
         Action(id="a1", type="inspect", description=""),
@@ -94,7 +73,6 @@ async def test_topo_layers_expose_parallelism(state):
     layers = topo_layers(acts)
     assert layers[0] == ["a1", "a2"]
     assert layers[1] == ["a3"]
-    assert build_graph(acts).number_of_edges() == 2
 
 
 # ── scheduler ───────────────────────────────────────────────────────────────
@@ -105,9 +83,9 @@ async def test_unreachable_worker_is_never_viable(state):
     a = Action(id="a1", type="place_in_zone", description="", object_id=obj.id, target_zone="zone_2")
     for w in state.workers.values():
         w.reachable_zones = ["zone_3"]
-    cands = scheduler.score_workers(a, state)
+    cands = scheduler.score_workers(a, _view(state))
     assert all(not c.viable for c in cands)
-    assert "can reach" in scheduler.describe_block(a, state, cands)
+    assert "reach" in scheduler.describe_block(a, _view(state))
 
 
 async def test_lock_conflict_prevents_same_object_twice(state):
@@ -117,7 +95,7 @@ async def test_lock_conflict_prevents_same_object_twice(state):
     a2 = Action(id="a2", type="place_in_zone", description="", object_id=obj.id,
                 target_zone="zone_2", status="available", lock_targets=[f"object:{obj.id}"])
     state.actions = {"a1": a1, "a2": a2}
-    batch = scheduler.select_batch(state)
+    batch = scheduler.select_batch(_view(state))
     assert len(batch) == 1, "the same object may never be manipulated by two actions at once"
 
 

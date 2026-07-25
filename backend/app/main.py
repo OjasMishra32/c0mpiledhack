@@ -52,9 +52,7 @@ async def _startup_probe() -> None:
     Free hosted endpoints vary by account, so the stack self-configures rather than
     trusting a hardcoded model id.
     """
-    from .planner.base import planner_probe
-
-    await asyncio.gather(analyzer.probe(), planner_probe.run())
+    await analyzer.probe()
     if analyzer.reasoner:
         await state.emit(
             "perception_ready",
@@ -68,12 +66,10 @@ async def _startup_probe() -> None:
             severity="warn",
         )
 
-    from .planner.base import planner_probe as _pp
-
     await state.emit(
         "planner_ready",
-        f"Task compiler ready — {_pp.reason}.",
-        severity="info" if _pp.usable else "warn",
+        "Task compiler ready — template library resident, model refinement in background.",
+        severity="info",
     )
 
     if settings.world_mode in ("live", "assisted"):
@@ -100,12 +96,6 @@ app.add_middleware(
 # ── HTTP ────────────────────────────────────────────────────────────────────
 
 
-def _planner_probe():
-    from .planner.base import planner_probe
-
-    return planner_probe
-
-
 @app.get("/api/health")
 async def health():
     from .vision.camera import camera
@@ -119,7 +109,7 @@ async def health():
         "camera": {"online": camera.online, "index": camera.index, "fps": camera.fps, "error": camera.error},
         "models": nim_client.health(),
         "perception": analyzer.health(),
-        "planner": {"usable": _planner_probe().usable, "reason": _planner_probe().reason},
+        "planner": {"model": settings.planner_model, "mode": "template-first, model upgrade in background"},
         "demo_mode": settings.demo_mode,
     }
 

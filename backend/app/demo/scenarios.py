@@ -120,10 +120,14 @@ WAREHOUSE = Scenario(
         "worker_e": ["zone_4", "zone_2", "zone_1", "field"],
     },
     expected_roles=["the red item", "the blue item", "the scanner", "packing materials", "the bulk item"],
+    # Each delivery is its own clause with its own destination. Grounding attaches an item
+    # to the location named in the same clause, so "A and B at the dock" would strand A.
     goal_template=(
-        "Fulfill expedited order 4471 at the {z2} and restock {z4}. "
-        "Order 4471 needs the {c1} item and the {c2} item at the {z2}. "
-        "Move the {c3} item to the {z4}. "
+        "Fulfill expedited order 4471. "
+        "Move the {c1} item to the {z2}. "
+        "Move the {c2} item to the {z2}. "
+        "Move the {c4} item to the {z2}. "
+        "Restock {z4} with the {c3} item. "
         "Packing cannot start until the {c4} item is at the {z2}."
     ),
     recommended_failure="Judge moves the scanner into Pick Aisle A.",
@@ -166,9 +170,12 @@ INCIDENT = Scenario(
     },
     expected_roles=["the medical kit", "the water supply", "the radio", "the battery", "the food"],
     goal_template=(
-        "Stabilize all zones. Deliver the {c1} supply and the {c2} supply to the {z1}. "
-        "Move the {c3} unit to the {z3}. Supply the {z2} with the {c4} unit. "
-        "Communications cannot be restored until the {c4} unit is at the {z3}."
+        "Stabilize all zones. "
+        "Deliver the {c1} supply to the {z1}. "
+        "Deliver the {c2} supply to the {z1}. "
+        "Move the {c3} unit to the {z3}. "
+        "Supply the {z2} with the {c4} unit. "
+        "Communications cannot be restored until the {c3} unit is at the {z3}."
     ),
     recommended_failure="Judge moves the battery out of the comms station.",
     expected_recovery="Freeze comms restoration only; reassign battery retrieval; medical and shelter continue.",

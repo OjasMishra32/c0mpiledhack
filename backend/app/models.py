@@ -7,32 +7,69 @@ If you change something here, change hive.ts and CONTRACTS.md in the same commit
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ── enums (plain string literals; they serialize as-is) ──────────────────────
 
-WorkerStatus = Literal[
-    "disconnected", "joining", "ready", "assigned", "executing",
-    "blocked", "paused", "unavailable", "emergency",
-]
-ActionStatus = Literal[
-    "queued", "available", "assigned", "dispatched", "acknowledged", "executing",
-    "awaiting_verification", "verified", "failed", "blocked", "cancelled", "recovery",
-]
+class WorkerStatus(str, Enum):
+    disconnected = "disconnected"
+    joining = "joining"
+    ready = "ready"
+    assigned = "assigned"
+    executing = "executing"
+    blocked = "blocked"
+    paused = "paused"
+    unavailable = "unavailable"
+    emergency = "emergency"
+
+
+class ActionStatus(str, Enum):
+    queued = "queued"
+    available = "available"
+    assigned = "assigned"
+    dispatched = "dispatched"
+    acknowledged = "acknowledged"
+    executing = "executing"
+    awaiting_verification = "awaiting_verification"
+    verified = "verified"
+    failed = "failed"
+    blocked = "blocked"
+    cancelled = "cancelled"
+    recovery = "recovery"
+
+
+class ActionType(str, Enum):
+    pick_up = "pick_up"
+    move_to_zone = "move_to_zone"
+    place_in_zone = "place_in_zone"
+    place_on = "place_on"
+    hold = "hold"
+    release = "release"
+    inspect = "inspect"
+    standby = "standby"
+
+
+class PredicateType(str, Enum):
+    object_in_zone = "object_in_zone"
+    object_near_object = "object_near_object"
+    object_stacked_on = "object_stacked_on"
+    object_held_by = "object_held_by"
+    worker_ready = "worker_ready"
+    worker_idle = "worker_idle"
+    object_visible = "object_visible"
+    sequence_completed = "sequence_completed"
+    all_objects_in_zone = "all_objects_in_zone"
+    worker_acknowledged = "worker_acknowledged"
+    manually_verified = "manually_verified"
+
+
 GoalStatus = Literal["draft", "compiling", "compiled", "executing", "paused", "completed", "failed", "aborted"]
 PlanSource = Literal["llm", "template", "demo_script", "manual"]
 WorldMode = Literal["live", "assisted", "simulation"]
 Severity = Literal["debug", "info", "warn", "critical", "success"]
-ActionType = Literal[
-    "pick_up", "move_to_zone", "place_in_zone", "place_on", "hold", "release", "inspect", "standby",
-]
-PredicateType = Literal[
-    "object_in_zone", "object_near_object", "object_stacked_on", "object_held_by",
-    "worker_ready", "worker_idle", "object_visible", "sequence_completed",
-    "all_objects_in_zone", "worker_acknowledged", "manually_verified",
-]
 EvidenceKind = Literal[
     "vision", "vlm", "worker_report", "host_override", "simulation", "timing",
     "inference", "system",
@@ -66,7 +103,11 @@ def now_iso() -> str:
 # ── geometry ────────────────────────────────────────────────────────────────
 
 
-class Point(BaseModel):
+class _Base(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+
+class Point(_Base):
     x: float = 0.5
     y: float = 0.5
 
@@ -74,7 +115,7 @@ class Point(BaseModel):
         return ((self.x - other.x) ** 2 + (self.y - other.y) ** 2) ** 0.5
 
 
-class Rect(BaseModel):
+class Rect(_Base):
     x: float
     y: float
     w: float
@@ -94,7 +135,7 @@ class Rect(BaseModel):
 # ── perception ──────────────────────────────────────────────────────────────
 
 
-class Descriptor(BaseModel):
+class Descriptor(_Base):
     """Everything here is MEASURED from the frame. Nothing is configured."""
 
     dominant_hsv: tuple[int, int, int] = (0, 0, 0)
@@ -106,7 +147,7 @@ class Descriptor(BaseModel):
     shape_hint: str = "irregular"
 
 
-class ObservedObject(BaseModel):
+class ObservedObject(_Base):
     id: str
     descriptor: Descriptor = Field(default_factory=Descriptor)
     position: Point = Field(default_factory=Point)
@@ -128,15 +169,20 @@ class ObservedObject(BaseModel):
     locked_by: str | None = None
 
     def display_label(self) -> str:
+        """Bare noun phrase — callers add their own article ("the {label}")."""
         if self.role:
-            return self.role
+            r = self.role.strip()
+            for article in ("the ", "a ", "an "):
+                if r.lower().startswith(article):
+                    return r[len(article):]
+            return r
         if self.semantic_label:
             return self.semantic_label
         d = self.descriptor
         return f"{d.color_name} {d.shape_hint} object".strip()
 
 
-class Zone(BaseModel):
+class Zone(_Base):
     id: str
     label: str
     bounds: Rect
@@ -145,7 +191,7 @@ class Zone(BaseModel):
     source: str = "drawn"  # detected | drawn | inferred
 
 
-class Scene(BaseModel):
+class Scene(_Base):
     objects: list[ObservedObject] = Field(default_factory=list)
     zones: list[Zone] = Field(default_factory=list)
     scanned_at: str = Field(default_factory=now_iso)
@@ -166,8 +212,12 @@ class Scene(BaseModel):
         o = self.by_id(oid)
         return o.display_label() if o else oid
 
+    @property
+    def visible_objects(self) -> list["ObservedObject"]:
+        return [o for o in self.objects if o.visible]
 
-class WorldState(BaseModel):
+
+class WorldState(_Base):
     """Camera/vision status. The scene itself lives on HiveState."""
 
     mode: WorldMode = "simulation"
@@ -185,7 +235,7 @@ class WorldState(BaseModel):
 # ── workers ─────────────────────────────────────────────────────────────────
 
 
-class Worker(BaseModel):
+class Worker(_Base):
     id: str
     display_name: str
     callsign: str
@@ -213,14 +263,14 @@ class Worker(BaseModel):
 # ── plan ────────────────────────────────────────────────────────────────────
 
 
-class Predicate(BaseModel):
+class Predicate(_Base):
     type: PredicateType
     subject: str
     object: str | None = None
-    tolerance: float = 0.12
+    tolerance: float | None = 0.12  # None where proximity is meaningless
 
 
-class Evidence(BaseModel):
+class Evidence(_Base):
     kind: EvidenceKind
     confidence: float = 1.0
     weight: float = 0.0
@@ -232,7 +282,7 @@ class Evidence(BaseModel):
             self.weight = EVIDENCE_WEIGHTS.get(self.kind, 0.1)
 
 
-class Instruction(BaseModel):
+class Instruction(_Base):
     id: str
     action_id: str
     worker_id: str
@@ -246,9 +296,9 @@ class Instruction(BaseModel):
     issued_at: str = Field(default_factory=now_iso)
 
 
-class Action(BaseModel):
+class Action(_Base):
     id: str
-    type: ActionType
+    type: str  # validated by planner.validator, not by the model
     description: str
     object_id: str | None = None
     target_object_id: str | None = None
@@ -279,7 +329,7 @@ class Action(BaseModel):
         return self.status in ("verified", "cancelled")
 
 
-class Goal(BaseModel):
+class Goal(_Base):
     id: str = "goal_1"
     raw_text: str = ""
     normalized_intent: str = ""
@@ -294,7 +344,7 @@ class Goal(BaseModel):
 # ── events & metrics ────────────────────────────────────────────────────────
 
 
-class Event(BaseModel):
+class Event(_Base):
     id: str
     seq: int
     timestamp: str
@@ -305,7 +355,7 @@ class Event(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class RunMetrics(BaseModel):
+class RunMetrics(_Base):
     actions_total: int = 0
     actions_verified: int = 0
     parallel_peak: int = 0
@@ -323,15 +373,57 @@ class RunMetrics(BaseModel):
 # ── transport ───────────────────────────────────────────────────────────────
 
 
-class InboundMessage(BaseModel):
+class InboundMessage(_Base):
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
     worker_id: str | None = None
     role: str = "host"
 
 
-class Envelope(BaseModel):
+class Envelope(_Base):
     type: str
     payload: Any = None
     ts: str = Field(default_factory=now_iso)
     seq: int = 0
+
+
+# Aliases so modules authored against the contract's alternate names keep working.
+Vec2 = Point
+Bounds = Rect
+
+
+class PlannerState(_Base):
+    """List-shaped snapshot the planner and scheduler read.
+
+    The live `HiveState` (app/state.py) keys workers and actions by id because everything
+    else looks them up that way; these subsystems iterate. `orchestrator._SchedulerView`
+    adapts the real state onto this shape, and tests construct it directly.
+    """
+
+    mode: str = "simulation"
+    scenario_id: str | None = None
+    goal: Goal | None = None
+    workers: list[Worker] = Field(default_factory=list)
+    actions: list[Action] = Field(default_factory=list)
+    scene: Scene = Field(default_factory=Scene)
+    locks: dict[str, str] = Field(default_factory=dict)
+    events: list[Event] = Field(default_factory=list)
+    lexicon: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def objects(self) -> list[ObservedObject]:
+        return self.scene.objects
+
+    @property
+    def zones(self) -> list[Zone]:
+        return self.scene.zones
+
+    def worker_by_id(self, worker_id: str) -> Worker | None:
+        return next((w for w in self.workers if w.id == worker_id), None)
+
+    def action_by_id(self, action_id: str) -> Action | None:
+        return next((a for a in self.actions if a.id == action_id), None)
+
+
+# Name the planner suite was authored against.
+HiveState = PlannerState
