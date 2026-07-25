@@ -81,15 +81,49 @@ async def h_compile_goal(p: dict[str, Any]) -> None:
         return
 
     if not result.actions:
-        state.execution_status = "idle"
-        await state.emit("plan_failed",
-                         "No executable actions for that objective. Try naming the items directly.",
-                         severity="critical")
-        return
+        # Grounding bound nothing — usually the objective names items that aren't on the
+        # table. Rather than leave the operator with an empty screen, restate the objective
+        # in terms of what the camera actually sees and compile that.
+        fallback = _objective_from_scene()
+        if fallback:
+            log.info("no bindings for %r — retrying with %r", text[:60], fallback[:60])
+            try:
+                result = await compile_goal(
+                    fallback, state.scene, list(state.workers.values()),
+                    scenario_id=state.scenario.id, use_llm=False,
+                )
+                text = fallback
+            except Exception:
+                result = None
+        if not result or not result.actions:
+            state.execution_status = "idle"
+            await state.emit("plan_failed",
+                             "No executable actions for that objective. Try naming the items directly.",
+                             severity="critical")
+            return
+    await _finish_compile(text, result)
 
+
+def _objective_from_scene() -> str:
+    """An objective phrased entirely in the colours the camera reports right now."""
+    zones = [z for z in state.scene.zones]
+    objs = [o for o in state.scene.objects if o.visible]
+    if not zones or not objs:
+        return ""
+    seen: set[str] = set()
+    parts: list[str] = []
+    for i, o in enumerate(objs):
+        c = o.descriptor.color_name
+        if c in seen:
+            continue
+        seen.add(c)
+        z = zones[i % len(zones)]
+        parts.append(f"Move the {c} item to the {z.label}.")
+    return " ".join(parts[:5])
+
+
+async def _finish_compile(text: str, result: Any) -> None:
     await _publish_plan(text, result, upgraded=False)
-
-    # Concurrently ask the hosted planner for a better graph.
     asyncio.create_task(_try_upgrade(text))
 
 

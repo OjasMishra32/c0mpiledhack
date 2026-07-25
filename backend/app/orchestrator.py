@@ -385,6 +385,17 @@ def _apply_recovery(plan: recovery_engine.RecoveryPlan) -> None:
             a.retry_count += 1
 
     for new in plan.insert_actions:
+        # One recovery per resource. Without this, a deviation that cannot resolve — an
+        # object nobody physically moves — re-fires every debounce window and buries the
+        # graph under duplicate retrievals.
+        if any(
+            a.is_recovery
+            and a.object_id == new.object_id
+            and a.target_zone == new.target_zone
+            and a.status not in ("verified", "cancelled")
+            for a in state.actions.values()
+        ):
+            continue
         if new.id not in state.actions:
             state.actions[new.id] = new
             # A single retrieval opens immediately; a recompiled chain keeps its ordering and
