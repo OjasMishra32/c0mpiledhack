@@ -126,7 +126,7 @@ export function WorldView({
         aria-hidden
         onLoad={() => setFeedLive(true)}
         onError={() => setFeedLive(false)}
-        className="pointer-events-none absolute inset-0 h-full w-full object-cover opacity-90"
+        className="pointer-events-none absolute inset-0 z-0 h-full w-full object-cover"
       />
 
       {!webglAvailable ? (
@@ -140,14 +140,13 @@ export function WorldView({
       ) : (
         <Canvas
           camera={{ position: [0, 0, 5], fov: 50 }}
-          gl={{ antialias: true, alpha: false }}
+          gl={{ antialias: true, alpha: true }}
           onPointerMissed={() => {
             onSelectObject?.(null);
             onSelectZone?.(null);
           }}
           frameloop={pageVisible ? 'always' : 'never'}
         >
-          <color attach="background" args={['#0b0b0c']} />
           {showVideo && videoRef.current && <VideoBackground video={videoRef.current} />}
 
           {zones.map((z) => (

@@ -83,15 +83,39 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
                 worker={w}
                 selected={w.id === selectedWorkerId}
                 onSelect={() => onSelectWorker(w.id === selectedWorkerId ? null : w.id)}
-                currentInstruction={
-                  w.status === 'executing'
-                    ? actions.find((a) => a.id === w.current_action_id)?.description
-                    : undefined
-                }
+                currentInstruction={instructionFor(w, actions)}
               />
             ))}
           </div>
         </section>
+
+        {actions.length > 0 && (
+          <>
+            <Rule />
+            <section>
+              <SectionLabel>Tasks</SectionLabel>
+              <div className="mt-2 flex flex-col gap-1">
+                {actions.map((a) => {
+                  const w = workers.find((x) => x.id === a.assigned_worker_id);
+                  const done = a.status === 'verified';
+                  const live = ['dispatched', 'acknowledged', 'executing'].includes(a.status);
+                  return (
+                    <div key={a.id} className="flex items-start gap-2">
+                      <span
+                        className="mt-1 h-1.5 w-1.5 shrink-0 rounded-control"
+                        style={{ backgroundColor: done ? 'var(--success)' : live && w ? w.color : 'var(--text-tertiary)' }}
+                      />
+                      <span className={`flex-1 text-[13px] leading-snug ${done ? 'text-text-tertiary line-through' : 'text-text-secondary'}`}>
+                        {a.description}
+                      </span>
+                      {w && <span className="shrink-0 text-[11px] text-text-tertiary">{w.callsign}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          </>
+        )}
 
         {zones.length > 0 && (
           <>
@@ -128,4 +152,13 @@ function noteFor(c?: { completed: number; reliability: number }): string | undef
   if (!c || !c.completed) return undefined;
   const base = `${c.completed} done`;
   return c.reliability < 1 ? `${base} · ${Math.round(c.reliability * 100)}% verified` : base;
+}
+
+/** The exact words on that person's phone, for any status where they hold the action.
+ *  The host is the commander and may see all five; the phones still see only their own. */
+function instructionFor(w: Worker, actions: Action[]): string | undefined {
+  if (!w.current_action_id) return undefined;
+  const a = actions.find((x) => x.id === w.current_action_id);
+  if (!a) return undefined;
+  return a.instruction?.display_text ?? a.description;
 }
