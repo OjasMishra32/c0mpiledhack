@@ -49,7 +49,7 @@ class Settings(BaseSettings):
 
     # ── runtime ─────────────────────────────────────────────────────────────
     demo_mode: bool = True
-    world_mode: str = "simulation"
+    world_mode: str = "live"
     camera_index: int = 0
     tick_hz: float = 4.0
     default_timeout_seconds: int = 25
