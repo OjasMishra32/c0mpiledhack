@@ -231,8 +231,10 @@ def scan(state: Any) -> int:
             if frame is not None:
                 world(state).rebuild_scene(frame)
                 _sync_occupancy(state)
+                state.scene.stable = True
                 return len(state.scene.objects)
         simulator(state).spawn_scene(n=5)
+        state.scene.stable = True
         _motions.clear()
         _sync_occupancy(state)
         return len(state.scene.objects)

@@ -47,10 +47,24 @@ async def h_compile_goal(p: dict[str, Any]) -> None:
             use_llm=False,
         )
     except NotReady as e:
-        state.execution_status = "idle"
-        await state.emit("plan_failed", str(e), severity="critical")
-        await ws.broadcast_host("error_event", {"code": "not_ready", "message": str(e)})
-        return
+        # A live camera watching a busy room may never report "settled". Refusing to plan
+        # is worse than planning against the latest snapshot and saying so.
+        log.info("scene not settled (%s) — compiling against the latest snapshot", e)
+        state.scene.stable = True
+        await state.emit(
+            "scene_unsettled",
+            "Scene still moving — compiling against the latest snapshot.",
+            severity="warn",
+        )
+        try:
+            result = await compile_goal(
+                text, state.scene, list(state.workers.values()),
+                scenario_id=state.scenario.id, hints=state.scenario.expected_roles, use_llm=False,
+            )
+        except Exception:
+            state.execution_status = "idle"
+            await state.emit("plan_failed", "Could not compile the objective.", severity="critical")
+            return
     except Exception as e:
         state.execution_status = "idle"
         log.exception("compile")

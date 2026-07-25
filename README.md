@@ -1,284 +1,157 @@
 # HIVE
 
-**The AI operating system for physical organizations.**
+**An AI operating system for physical work.**
 
-HIVE takes a high-level objective, observes a physical space through an ordinary camera, decomposes
-the objective into a dependency-aware task graph, dispatches *private* instructions to individual
-humans, verifies what actually happened, detects when reality diverges from the plan, and replans
-in real time — without restarting the operation.
-
-Five people around a table. None of them knows the whole plan. Each one receives only their next
-physical action. HIVE holds the shared world model.
+You give HIVE an objective in one sentence. It looks at the space through a camera, works
+out what needs to happen, and sends each person a single private instruction. It watches
+what actually happens, and when reality stops matching the plan, it repairs the plan
+around the problem instead of starting over.
 
 ---
 
 ## The problem
 
-Physical organizations do not fail because nobody knows what to do. They fail because **plans go
-stale faster than people can re-coordinate**.
+Physical operations don't fail because nobody knows what to do. They fail because **the
+plan goes stale faster than people can re-coordinate.**
 
-A worker only sees their local task. A manager cannot continuously observe everything. One missing
-person, one misplaced resource, one blocked area — and the delay cascades through every downstream
-task, silently, until someone notices.
+A worker sees only their own task. A supervisor can't watch everything at once. One person
+missing, one item in the wrong place, one blocked aisle — and the delay cascades silently
+through everything downstream until somebody notices.
 
-HIVE is the layer that notices. Continuously.
+HIVE is the layer that notices, continuously, and reacts in under a second.
 
-## The live demo: warehouse floor
+---
 
-Five workers around a table. A webcam overhead. Four taped zones — **Inbound Dock**, **Pack
-Station**, **Pick Aisle A**, **Pick Aisle B** — and some objects standing in for inventory.
+## What it actually does
 
-**HIVE has never seen any of it.** The presenter clicks *Scan Scene*; the camera discovers whatever
-is actually on the table and reports what it found, in the objects' real sampled colors. Then the
-presenter types a task in plain language, and HIVE binds the sentence to what it can see:
+```
+  camera  ──▶  discovers what's on the table (no preset list of objects)
+                          │
+  "one sentence" ─────────┤  binds your words to the objects it can actually see
+                          ▼
+              validated task graph  ──  what depends on what, what can run at once
+                          │
+                          ▼
+              capability-aware scheduling  ──  who can reach it, who's free, who's proven
+                          │
+                          ▼
+        five phones, five different private instructions
+                          │
+                          ▼
+        verification against the camera + the worker's own report
+                          │
+                          ▼
+        deviation detected ──▶ freeze only the affected chain ──▶ reassign ──▶ resume
+```
 
-> Fulfill expedited order 4471 at the pack station and restock Pick Aisle B. Order 4471 needs the
-> red item and the blue item. Packing can't start until the scanner is docked and materials staged.
+**Nothing about the objects is hardcoded.** There is no list of "red = medical kit" in this
+codebase. The camera discovers whatever is physically there, measures its colour, size and
+shape, and gives it an id. Your sentence is then resolved against *that* — so you can swap
+an object, rescan, and it still works. There is a test that fails if anyone reintroduces a
+hardcoded object.
 
-*"the scanner"* resolves to a specific discovered object. So does *"the blue item."* Swap an object
-for a different one, rescan, and it still works — there is no object manifest anywhere in the
-system. HIVE then produces ~11 actions across 5 workers, identifies which 4 can run in parallel and
-which 2 contend for the same item, and dispatches private instructions — each phone gets one atomic
-task and nothing else.
+---
 
-Then **a judge walks up and moves the scanner into the wrong aisle.**
+## The five things that make it more than a task list
 
-The webcam sees it. The host screen goes red:
+**1. Instructions are private.**
+Each phone receives only its own next action — never the objective, never the plan, never
+anyone else's task. Five people execute a coordinated operation without talking to each
+other. Enforced server-side and covered by a test.
 
-> **FLOOR STATE DEVIATION** — Handheld scanner detected in Pick Aisle A, expected Pack Station.
-> Packing workflow blocked. 3 dependent actions paused. **REPLANNING.**
+**2. It verifies instead of assuming.**
+A worker tapping "done" is *evidence*, not proof. It's weighted (0.30) against what the
+camera sees (0.60) and what a vision-language model reports (0.55). An action verifies when
+the combined confidence clears 0.70 — so a person who says "done" without doing it fails
+verification. The UI shows the honest number, not a fake 100%.
 
-HIVE freezes *only* the packing chain, works out which worker can reach the scanner, reassigns
-retrieval, lets picking and restock continue uninterrupted, then resumes packing once the scanner is
-back. Nothing restarts. The operation bends and keeps going.
+**3. It repairs instead of restarting.**
+When something diverges, HIVE freezes *only* the dependency chain that touches the affected
+resource. Everything else keeps running. It inserts a recovery action, re-scores who should
+take it, and resumes. Nothing restarts.
 
-That is the product: **it heals and redirects people in real time when the plan goes stale.**
+**4. It doesn't cry wolf.**
+Before showing a deviation, it sends the last ~2.5 seconds of frames to a physical-reasoning
+model and asks whether the item genuinely moved, or was briefly occluded by a hand, or was
+misclassified. A refuted alarm is dismissed quietly. Critically, this **fails open**: if the
+model is slow or unreachable, the deviation fires anyway. A hung endpoint can never swallow
+a real one.
 
-## The vision use case: campus emergency (video)
+**5. It delegates on evidence, not just capability.**
+The scheduler answers *who can do this* from reachability, workload and capability.
+Attribution answers *who should* from what has actually happened this run: whether their
+reports survived verification, how fast they are, whether they've worked that area before.
+Every assignment carries the sentence explaining itself:
 
-The same system, a different operation — and the reason the architecture matters.
+> **CHARLIE selected:** closest to the scanner, currently idle, no conflicting activity in
+> Pack Station. DELTA was mid-task.
 
-A school in emergency lockdown. Every staff member needs a *different* instruction, silently, based
-on where they are: Wing A evacuates north, Wing B goes west, the gym holds because its only route
-crosses the affected area. A PA announcement cannot say three different things at once. HIVE can.
-
-It routes individually, delivers silently (no audio, no vibration, minimum screen brightness),
-reconciles live headcounts against the roster (`100 / 119 accounted · Group 4 unreported`), reroutes
-only the affected groups when new information arrives, and places a voice call to the district
-safety line with a structured situation report compiled from live state — while the coordinator
-keeps both hands on the evacuation.
-
-**HIVE assists staff executing an established protocol.** It does not replace emergency dispatch and
-does not make life-safety decisions autonomously. Every instruction it sends is one a trained
-coordinator could have sent — HIVE sends it individually, simultaneously, and silently, which a
-human coordinator cannot.
-
-It is the same loop, the same code, a different scenario file. That is the whole argument.
-
-See `docs/SCENARIOS.md` for both, plus disaster response, sorting, and relay scenarios.
-
-## Why this is an "AI operating system for companies"
-
-An OS does three things: it maintains a model of the machine's state, it schedules work onto
-limited resources, and it recovers when a process misbehaves. HIVE does exactly that — with the
-physical world as the machine and people, robots, and devices as the execution units.
-
-The tabletop is a scale model. The same loop runs a warehouse floor, a hospital's logistics, an
-airport turnaround, a construction site, a campus evacuation, or a disaster response. **A scenario
-is data — zones, labels, objects, goal text — not code.** Retargeting HIVE to a new operation is a
-config file, and we demonstrate that live by switching scenarios mid-demo.
-
-Point it at existing CCTV instead of a webcam and the perception layer needs no redesign: the world
-model consumes normalized detections, not camera-specific frames.
+That's generated from explicit scoring factors — not a model's hidden reasoning.
 
 ---
 
 ## Architecture
 
-```
-   ┌───────────────────────────────────┐   High-level objective, plain language
-   │  PERCEPTION (two independent      │   ("fulfill order 4471, restock aisle B")
-   │  sensors over one camera feed)    │                  │
-   │                                   │                  │
-   │  OpenCV tracker      10 Hz        │                  │
-   │    → position, zone, identity     │                  │
-   │  VLM (NVIDIA NIM)    ~1.4 Hz      │                  │
-   │    → what things ARE, who is      │                  │
-   │      holding what, what stacked   │                  │
-   │      on what, what just happened  │                  │
-   │                                   │                  │
-   │  fused → obj_1..obj_N, zones      │                  │
-   └───────────────────────────────────┘                  │
-                     │                                    │
-                     └────────────┬───────────────────────┘
-                                  ▼
-                    ┌────────────────────────┐
-                    │  Grounding / reference │   "the scanner" → obj_3
-                    │  resolution            │   ambiguity → ask the operator
-                    └────────────────────────┘
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │   AI task compiler     │   LLM planner ─┐
-                    │   (planner/)           │                ├─▶ falls back silently
-                    └────────────────────────┘   Template ────┘
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │  Graph validator       │   cycles · unknown ids · unreachable
-                    │  (planner/validator)   │   actions · unsafe parallelism
-                    └────────────────────────┘
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │ Capability-aware       │   distance · workload · reachability
-                    │ scheduler + locks      │   capability · collision · fairness
-                    └────────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    ▼                         ▼
-         ┌────────────────────┐   ┌────────────────────────┐
-         │ Private worker     │   │ Orchestrator loop      │
-         │ clients (phones)   │◀─▶│ 4 Hz state machine     │
-         └────────────────────┘   └────────────────────────┘
-                    │                         ▲
-                    ▼                         │
-            Physical execution                │
-                    │                         │
-                    ▼                         │
-         ┌────────────────────────┐           │
-         │ Vision (OpenCV, 10fps) │───────────┤
-         │ + worker feedback      │           │
-         └────────────────────────┘           │
-                    │                         │
-                    ▼                         │
-         ┌────────────────────────┐           │
-         │ Weighted verification  │           │
-         │ Deviation detection    │───────────┘
-         │ Recovery engine        │      ↺ replan, don't restart
-         └────────────────────────┘
-                    │
-                    ▼  (zone critical + no responder reassignable)
-         ┌────────────────────────┐
-         │ Voygr Callwright       │   HIVE places a real phone call
-         │ voice escalation       │   to a human supervisor
-         └────────────────────────┘
-```
+**Perception is two independent sensors over one camera feed.** OpenCV runs at 10–20 Hz and
+owns geometry and object identity. A vision-language model runs only on meaningful events
+and owns meaning — what things are, who is holding what, what just changed. Neither is a
+single point of failure.
 
-**The design principle:** the LLM thinks *occasionally* (goal → plan, and hard recovery decisions).
-Deterministic code controls *continuously* (scheduling, verification, state machine, dispatch).
-An LLM in the inner loop is a demo that hangs on stage.
+**The model thinks occasionally; deterministic code controls continuously.** The task
+compiler runs locally and instantly; a hosted model runs concurrently and only ever
+*upgrades* the plan, never gates it. A 4 Hz state machine owns every status transition, with
+one writer and one event sequence, so five phones responding simultaneously can't race.
 
----
+**It degrades on purpose.** No API key → the local compiler runs the whole demo. No camera →
+simulation mode, fully labeled. Phone drops → the work is reassigned automatically, and
+that's a feature we demonstrate rather than hide.
 
-## Quick start
-
-```bash
-make install     # backend venv + frontend node_modules
-make dev         # backend :8000 + frontend :5173
-make live        # same, with the camera on
-make test        # backend pytest + frontend typecheck
-make ip          # print the join URL to point phones at
-```
-
-Open **http://localhost:5173/host**. The frontend proxies `/api` and `/ws` to the backend,
-so the host and every phone share one origin — one URL to explain, no CORS, no mixed
-content.
-
-Then, on the host page: **Scan scene** → type an objective → **Compile** → **Start**.
-
-Works with no API key. Works with no camera. Works with no phones.
-
-### Connecting phones
-
-1. Laptop and phones on the **same Wi-Fi**. (Conference Wi-Fi with client isolation will block this
-   — use a phone hotspot that the laptop *also* joins. Test this before you present.)
-2. `make dev` prints e.g. `join → http://192.168.1.42:5173/join`
-3. The QR code on `/host` encodes exactly that URL.
-4. Each phone that scans gets the next free slot: ALPHA, BRAVO, CHARLIE, DELTA, ECHO.
-5. Refreshing a phone reclaims the same slot via a `localStorage` token.
-
-### Environment
-
-Copy `.env.example` → `.env`. Every variable has a working default; none are required.
-
-| Variable | Default | Effect if absent |
-| --- | --- | --- |
-| `NVIDIA_API_KEY` | — | **the only key you need.** Without it: template planner + CV-only perception. Everything still runs. |
-| `PLANNER_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | task-graph compilation |
-| `VLM_FAST_MODEL` | `nvidia/nemotron-nano-12b-v2-vl` | continuous structured scene reads |
-| `VLM_REASON_MODEL` | `nvidia/cosmos3-nano-reasoner` | deviation adjudication, physical reasoning |
-| `VLM_FAST_HZ` | `1.4` | raise cautiously — cost and latency scale linearly |
-| `DEMO_MODE` | `true` | shorter timeouts, simulated workers available, polished copy |
-| `WORLD_MODE` | `simulation` | `live` \| `assisted` \| `simulation` |
-| `CAMERA_INDEX` | `0` | falls back to simulation if the device cannot be opened |
-| `CALLWRIGHT_API_KEY` | — | escalation logs an event instead of dialing |
-| `CALLWRIGHT_BASE_URL` | `https://api.voygr.tech` | — |
-| `ESCALATION_PHONE` | — | required for a live call |
-
----
-
-## Running degraded (read this before the demo)
-
-| What broke | What HIVE does | What you do |
-| --- | --- | --- |
-| No API key / LLM down | Template planner, identical graph | Nothing. Say "plan compiled from the operations template library." |
-| Camera index changed | Falls back to any device that produces a frame, logs which | Nothing — capture indices shift whenever anything is replugged |
-| Camera missing/denied | Auto-switch to simulation, banner shows mode | Nothing. Drag objects in the world view. |
-| VLM endpoint down/slow | One `warn` event, then silence. CV tracker carries verification. | Nothing. Semantics degrade, coordination doesn't. |
-| Vision misreads an object | Assisted mode: click the true position on the feed | Click it. Logs "host-assisted observation." |
-| Wi-Fi drops a phone | Worker marked disconnected, action auto-reassigned | Nothing — *this is a feature, let it happen* |
-| Everything is on fire | Advanced Controls → Load known-good graph → step actions manually | Present the graph and the recovery story |
-
-`make demo` with zero network, zero camera, zero phones still runs the entire flagship sequence
-end to end. Verified by `backend/tests/test_e2e_flagship.py`.
-
----
-
-## Repository layout
-
-```
-hive/
-├── backend/app/
-│   ├── main.py config.py models.py state.py websocket_manager.py
-│   ├── orchestrator.py scheduler.py verifier.py recovery.py
-│   ├── planner/     base.py llm_planner.py template_planner.py validator.py prompts.py
-│   ├── vision/      camera.py color_tracker.py world_model.py calibration.py
-│   ├── integrations/voygr.py
-│   └── demo/        scenarios.py simulator.py
-├── frontend/src/
-│   ├── routes/      Host.tsx Join.tsx Worker.tsx
-│   ├── components/  TaskGraph WorldView WorkerGrid EventTimeline AdvancedControls …
-│   ├── hooks/       useHiveSocket useSpeech useHaptics
-│   └── types/hive.ts
-├── docs/CONTRACTS.md      ← the shared spine, read this first
-├── Ojas.md Zechariah.md David.md Steven.md Nikki.md   ← per-person handoffs
-└── Makefile .env.example
-```
-
-## Team
-
-| Person | Owns | Handoff |
-| --- | --- | --- |
-| **Ojas** | Intelligence, orchestration loop, perception, demo direction | `OJAS.md` |
-| **Steven** | Interface — host command center, deviation choreography, phone client | `STEVEN.md` |
-| **Zechariah** | Planning, grounding, validation, capability-aware scheduling | `ZECHARIAH.md` |
-
-Start with `docs/CONTRACTS.md`, then your own handoff. **`git pull --rebase origin main` before every session.**
+Stack: Python · FastAPI · WebSockets · OpenCV · NetworkX · NVIDIA NIM · React · TypeScript ·
+Three.js
 
 ---
 
 ## Where this goes
 
-The tabletop demo is deliberately small so the architecture is visible. Nothing in the core loop
-assumes humans:
+The tabletop is deliberately small so the architecture is visible. Nothing in the core loop
+assumes humans or webcams:
 
-- **Perception** is an interface. Today: one webcam and HSV color tracking. Tomorrow: existing CCTV,
-  RTSP fleets, badge scans, RFID, WMS events, telematics. The world model does not care.
-- **Actuators** are an interface. Today: a phone that speaks an instruction. Tomorrow: an AMR
-  accepting a waypoint, a PLC, a Zapier webhook, a work-order in an existing system.
-- **Verification** is evidence-weighted by design, so a barcode scan, a robot's own odometry, and a
-  human tapping "done" all compose into the same confidence score.
+- **Perception is an interface.** Today a webcam and colour tracking. Tomorrow existing CCTV,
+  RFID, badge scans, WMS events — the world model consumes normalized detections, not frames.
+- **Actuation is an interface.** Today a phone that shows an instruction. Tomorrow an AMR
+  accepting a waypoint, a PLC, a work order in an existing system.
+- **Verification is evidence-weighted by design**, so a barcode scan, a robot's odometry and
+  a human tapping "done" all compose into the same confidence score.
 
-The execution layer for physical companies is the same loop at every scale: observe, plan, dispatch,
-verify, recover.
+Warehouses, hospital logistics, airport turnarounds, construction, disaster response — and
+building evacuation, where forty people each need a different instruction, silently, in the
+same second.
+
+---
+
+## Running it
+
+```bash
+make install
+make dev          # or: make live   (camera on)
+make ip           # prints the URL for phones
+make test         # 140 tests
+```
+
+Host: `localhost:5173/host` · Phones: the URL from `make ip`
+Then: **Scan scene → type an objective → Compile → Start execution.**
+
+Runs with no API key, no camera, and no phones. See `DEMO.md` for the full runbook.
+
+---
+
+## Honest notes
+
+- The demo runs in **simulation mode** when the physical scene is too visually noisy to bind
+  reliably — a real, labeled mode, not a mock. The perception, planning, scheduling,
+  verification and recovery paths are identical either way.
+- `nvidia/cosmos-*` models return 404 on our account (a known hosted-endpoint permission
+  gap), so the perception layer probes at startup and self-configures onto whatever model is
+  actually reachable.
+- Voice escalation via Voygr ships **disarmed** — an accidental live call during setup dials
+  a real person.
