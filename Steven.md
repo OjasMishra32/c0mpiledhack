@@ -6,6 +6,30 @@
 > perception — it is perception that degrades gracefully and *looks* extraordinary.
 > Read `docs/CONTRACTS.md` first.
 
+## 0. Integration status — read this first
+
+Your camera, discovery, world model and simulator are merged and green.
+
+**The core does not import your classes directly.** `backend/app/vision/bridge.py` (owner:
+Ojas) holds the singletons and exposes the flat, per-tick API the orchestrator uses
+(`refresh`, `scan`, `burst`, `snapshot_jpeg`, `set_object_zone`, …). If one of your
+signatures changes, the bridge absorbs it and nothing else moves. It also adds the two
+things the core needs that vision has no reason to provide: a JPEG ring buffer feeding the
+reasoning bursts, and eased motion so simulated objects glide rather than teleport.
+
+Two changes landed in **your files**:
+
+1. **`simulator.py` — `_distinct_hue` now requires distinct *names*, not just distinct
+   degrees.** "indigo" and "magenta" are far apart numerically but normalize to adjacent
+   colour words, so a generated scene could make HIVE's own suggested objective ambiguous
+   against the scene it had just discovered. A well-set-up table has objects a person can
+   name unambiguously; a simulated one should be no different.
+2. `models.py` gained `Scene.object_count` and a non-serialized `WorldState.objects` mirror,
+   so your `state.world.objects = …` writes work while the wire keeps one source of truth.
+
+`state.py` gained `mark_world_dirty`, `emit_nowait` and `override_active`, so your 10–20 Hz
+loop shares one gap-free event sequence and one coalesced broadcast with everything else.
+
 ### Your split with Ojas — read this before writing any code
 
 Ojas owns a **VLM perception layer** (`Ojas.md` §8b) running NVIDIA NIM models on the same camera

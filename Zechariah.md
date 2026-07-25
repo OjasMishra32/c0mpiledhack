@@ -19,6 +19,37 @@ backend/tests/test_grounding.py  test_planner.py  test_validator.py  test_schedu
 
 ---
 
+## 0. Integration status — read this first
+
+Your workstream is merged and green. Three things changed in **your files** during
+integration; all three were blocking the flagship, and all three have tests:
+
+1. **`grounding.py` — zone phrases were deduped by text.** In *"Move X to the Pack Station.
+   Move Y to the Pack Station."* only the first mention produced a `ZoneBinding`, so every
+   later item found no destination in its clause and silently dropped out of the plan.
+   Pairing is span-based, so every mention must bind. Now keyed by `(phrase, span)`.
+
+2. **`grounding.py` — `_label_tokens` stripped articles anywhere in a label.** `"Pick Aisle A"`
+   tokenised to `["pick", "aisle"]`, so it matched *"Pick Aisle B"*. Articles are now stripped
+   only at the front, where they are actually articles; a trailing `"A"` is an identifier.
+
+3. **`grounding.py` — colour normalization was one-sided.** The vision namer emits `teal`,
+   `lime`, `indigo`; `_phrase_colors` normalized the *operator's* word through
+   `COLOR_SYNONYMS` but not the *object's*, so HIVE would print "teal item" on screen and
+   then fail to resolve "the teal item". Both sides normalize now, and `indigo` was missing
+   from the vocabulary entirely. **The namer's vocabulary and yours must stay identical** —
+   there is a test asserting it.
+
+Your three contract decisions in `docs/PLANNER_NOTES.md` were all accepted and are now in
+`docs/CONTRACTS.md §8`. Per-object locks in particular: the core reached the same conclusion
+independently, for the same reason.
+
+One thing you own that is still open: **the survey-floor fallback means a narrower objective
+can produce a *larger* graph.** That is defensible, but it surprised a test and it will
+surprise a judge who types a one-item goal and watches the DAG grow. Worth a look.
+
+---
+
 ## 1. Your prime directive
 
 **Nothing about the objects is known ahead of time.**
