@@ -109,7 +109,7 @@ ActionType    = pick_up | move_to_zone | place_in_zone | place_on | hold | relea
 PredicateType = object_in_zone | object_near_object | object_stacked_on | object_held_by
               | worker_ready | worker_idle | object_visible | sequence_completed
               | all_objects_in_zone | worker_acknowledged | manually_verified
-EvidenceKind  = vision | vlm | worker_report | host_override | simulation | timing | inference
+EvidenceKind  = vision | vlm | worker_report | host_override | simulation | timing | inference | system
 PerceptionTier= cv | vlm_fast | vlm_reason
 ```
 
@@ -341,6 +341,7 @@ score = Σ (evidence.confidence × evidence.weight)
 | `host_override` | 1.00 | operator confirmed |
 | `timing`      | 0.10   | elapsed-time inference |
 | `inference`   | 0.15   | derived from other verified predicates |
+| `system`      | 0.90   | a fact about HIVE's own verified records, e.g. "all prerequisites verified". Not a sensor reading, so it is not hedged like one. |
 
 `vision` and `vlm` are **independent sensors** and both may contribute to the same predicate — CV
 says the centroid is inside the zone (0.6 × 0.85 = 0.51), the VLM says "the yellow box is sitting in
@@ -535,3 +536,75 @@ except for `models.py` / `hive.ts` / this document, where you ask the whole team
    A crashed loop is a dead demo. A logged exception is a shrug.
 5. **Reset must be total.** `host_reset` rebuilds state from the scenario, keeps sockets alive,
    re-pushes snapshots, clears speech queues. We will press it a dozen times tomorrow.
+
+
+---
+
+## 8. Decisions settled during integration
+
+These were open in the contract and are now pinned. Changing one means changing all the
+code that depends on it, so raise it with the team first.
+
+### 8.1 Locks are per-object, never per-zone
+
+Two people cannot carry the same item; several can walk to the same station. Zone locks
+would serialise the flagship's opening wave into a queue. Zone contention is a *soft*
+scheduler cost (`collision_penalty`), not a hard lock.
+
+### 8.2 Status enums are `str, Enum` with `use_enum_values`
+
+`ActionStatus.assigned.value` exists for code that wants the constant, while instances
+hold plain strings — so `action.status == "verified"` works everywhere and JSON
+serialization is unchanged. **`Action.type` is deliberately typed `str`, not the enum:**
+rejecting an unsupported action type is the validator's job, and it has a readable
+message for it. Rejecting it at model construction just raises on a malformed plan that
+we could otherwise have repaired.
+
+### 8.3 Two predicate encodings are both valid
+
+| Predicate | Encoding A | Encoding B |
+| --- | --- | --- |
+| `all_objects_in_zone` | `subject = "obj_1\|obj_2"` — those objects | `subject = "<zone_id>"` — every object the plan routes there |
+| `sequence_completed` | `subject = "a1\|a2"` — those actions | a sentinel such as `"objective"` — every other action in the plan |
+
+The verifier accepts both. Planner and verifier stay decoupled; neither has to know which
+convention the other prefers.
+
+### 8.4 One colour vocabulary
+
+The vision namer and the grounding resolver must recognise exactly the same set of colour
+words, and both must normalize through the same synonym map. Otherwise HIVE displays
+"teal item" on screen and then cannot understand an operator saying "the teal item".
+There is a test for this; do not let the two lists drift.
+
+### 8.5 `display_label()` returns the role verbatim
+
+The label is data. Adding an article is presentation, so a caller that writes
+`"the {label}"` strips a leading article first — otherwise instructions read
+"MOVE THE THE SCANNER".
+
+### 8.6 Reset is total
+
+`host_reset` clears debounce counters, disconnect grace timers, locks, host overrides,
+simulated motion, escalation cooldowns and attribution — not just actions and goal.
+Anything a module keeps between ticks must be cleared there, or the second run of a demo
+inherits the first one's state.
+
+---
+
+## 9. Attribution — who did what
+
+`backend/app/attribution.py` (owner: Ojas) records, per worker and per run:
+
+| Signal | Meaning |
+| --- | --- |
+| `reliability` | fraction of their "done" reports that survived verification |
+| `mean_seconds` | rolling mean dispatch→verified over their last 5 actions |
+| `zones` / `objects` | where and what they have successfully worked |
+| `last_finished_at` | recency, so work stays spread across all five |
+
+It produces a small score adjustment plus the phrase that explains it. **Capability decides
+who is eligible; attribution only breaks ties among candidates the scheduler already
+judged viable.** A worker who fails once slides down the list; they are never exiled.
+
+Exposed as `contributions` in `state_snapshot` and in the `goal_completed` payload.
