@@ -24,8 +24,9 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
 
   return (
     <Panel className="border-r border-separator" scroll>
-      {/* One vertical rhythm the whole column obeys: 24px between sections,
-          12px between a label and the thing it labels. */}
+      {/* One vertical rhythm the whole column obeys: 24px between sections, and an
+          optical 12px between a label and what it labels — which means a smaller
+          margin where the rows underneath carry their own padding. */}
       <div className="flex flex-col gap-6 px-4 py-5">
         <section>
           <SectionLabel>Objective</SectionLabel>
@@ -74,7 +75,7 @@ export function Sidebar({ goal, actions, workers, contributions = [], zones = []
           <SectionLabel>Workers</SectionLabel>
           {/* Rows bleed 8px past the column padding so their hover fill looks
               deliberate while the text stays on the same left edge as the labels. */}
-          <div className="-mx-2 mt-2 flex flex-col gap-0.5">
+          <div className="-mx-2 mt-1 flex flex-col gap-0.5">
             {workers.map((w) => (
               <WorkerRow
                 key={w.id}
