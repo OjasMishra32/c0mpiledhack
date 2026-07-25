@@ -4,21 +4,21 @@
 // messages by `seq`, one immutable message replacing the last on each update.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Envelope } from "../types/hive";
+import type { WsEnvelope } from "../types/hive";
 
 export type SocketRole = "host" | "worker";
 
 interface UseHiveSocketResult {
   connected: boolean;
   reconnecting: boolean;
-  lastMessage: Envelope | null;
+  lastMessage: WsEnvelope | null;
   send: (type: string, payload?: Record<string, unknown>) => void;
 }
 
 export function useHiveSocket(role: SocketRole, token?: string | null): UseHiveSocketResult {
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
-  const [lastMessage, setLastMessage] = useState<Envelope | null>(null);
+  const [lastMessage, setLastMessage] = useState<WsEnvelope | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const backoffRef = useRef(250);
   const seenSeq = useRef<Set<number>>(new Set());
@@ -49,7 +49,7 @@ export function useHiveSocket(role: SocketRole, token?: string | null): UseHiveS
     sock.onerror = () => sock.close();
     sock.onmessage = (event: MessageEvent<string>) => {
       try {
-        const msg = JSON.parse(event.data) as Envelope;
+        const msg = JSON.parse(event.data) as WsEnvelope;
         if (msg.seq && seenSeq.current.has(msg.seq)) return;
         if (msg.seq) seenSeq.current.add(msg.seq);
         setLastMessage(msg);

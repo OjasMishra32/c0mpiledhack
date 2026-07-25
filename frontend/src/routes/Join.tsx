@@ -1,3 +1,4 @@
+import "../styles.css";
 // /join — see Nikki.md §2. The audio-test gate exists for one reason: iOS Safari
 // will not speak until a user gesture has unlocked the speech API, so "Test Audio"
 // is impossible to skip — it gates the Ready button.
@@ -6,7 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useHiveSocket } from "../hooks/useHiveSocket";
 import { useSpeech } from "../hooks/useSpeech";
-import type { WorkerIdentity } from "../types/hive";
+import type { Worker } from "../types/hive";
 
 const TOKEN_KEY = "hive_token";
 
@@ -22,7 +23,7 @@ export default function Join() {
   const navigate = useNavigate();
   const token = useMemo(readOrCreateToken, []);
   const { connected, lastMessage, send } = useHiveSocket("worker", token);
-  const [identity, setIdentity] = useState<WorkerIdentity | null>(null);
+  const [identity, setIdentity] = useState<Worker | null>(null);
   const [audioTested, setAudioTested] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { speak, supported } = useSpeech(identity?.callsign ?? "", false);
@@ -30,7 +31,7 @@ export default function Join() {
   useEffect(() => {
     if (!lastMessage) return;
     if (lastMessage.type === "worker_assigned") {
-      const payload = lastMessage.payload as { identity: WorkerIdentity; token: string };
+      const payload = lastMessage.payload as { identity: Worker; token: string };
       setIdentity(payload.identity);
       localStorage.setItem(TOKEN_KEY, payload.token);
     }

@@ -1,3 +1,4 @@
+import "../styles.css";
 // /worker/:id — the worker phone. Nikki.md §2: never show the objective, the task
 // graph, other workers, or how many actions remain. A worker who can infer the plan
 // breaks the entire premise — this component receives ONLY its own instructions.
@@ -11,7 +12,7 @@ import { useEffect, useRef, useState } from "react";
 import { useHiveSocket } from "../hooks/useHiveSocket";
 import { useSpeech } from "../hooks/useSpeech";
 import { useHaptics } from "../hooks/useHaptics";
-import type { Instruction, WorkerIdentity } from "../types/hive";
+import type { Instruction, Worker } from "../types/hive";
 
 const TOKEN_KEY = "hive_token";
 const EMERGENCY_HOLD_MS = 800;
@@ -19,7 +20,7 @@ const EMERGENCY_HOLD_MS = 800;
 export default function Worker() {
   const token = localStorage.getItem(TOKEN_KEY);
   const { connected, reconnecting, lastMessage, send } = useHiveSocket("worker", token);
-  const [identity, setIdentity] = useState<WorkerIdentity | null>(null);
+  const [identity, setIdentity] = useState<Worker | null>(null);
   const [instruction, setInstruction] = useState<Instruction | null>(null);
   const [completedTapped, setCompletedTapped] = useState(false);
   const [emergencyArming, setEmergencyArming] = useState(false);
@@ -38,7 +39,7 @@ export default function Worker() {
     if (!lastMessage) return;
     switch (lastMessage.type) {
       case "worker_assigned": {
-        const payload = lastMessage.payload as { identity: WorkerIdentity };
+        const payload = lastMessage.payload as { identity: Worker };
         setIdentity(payload.identity);
         break;
       }

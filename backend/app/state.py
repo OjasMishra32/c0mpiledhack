@@ -13,6 +13,7 @@ import contextlib
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from .config import settings
